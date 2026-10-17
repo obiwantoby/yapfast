@@ -5,6 +5,15 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=packaging/windows");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        // libwebrtc reaches for NSString categories compiled into it, such as
+        // `+[NSString stringForAbslStringView:]`, which nothing refers to by
+        // name. An archive member holding only categories is otherwise left
+        // out of the link, and asking for one crashes. webrtc-sys asks for
+        // this too, but Cargo only honours a link argument for targets of the
+        // package that emits it, so the executable needs it from here.
+        println!("cargo:rustc-link-arg=-ObjC");
+    }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
