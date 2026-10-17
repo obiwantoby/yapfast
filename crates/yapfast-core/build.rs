@@ -12,6 +12,7 @@ fn main() {
         "video.c",
         "picture.c",
         "camera.cc",
+        "coreaudio.c",
     ] {
         println!("cargo:rerun-if-changed=native/{file}");
     }
@@ -23,6 +24,17 @@ fn main() {
         .warnings(true)
         .compile("yapfast_picture");
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    // macOS sound goes through CoreAudio's output unit, both ways: see
+    // src/audio_io/coreaudio.rs for the Rust side of it.
+    if target_os == "macos" {
+        cc::Build::new()
+            .file("native/coreaudio.c")
+            .warnings(true)
+            .compile("yapfast_coreaudio");
+        println!("cargo:rustc-link-lib=framework=AudioToolbox");
+        println!("cargo:rustc-link-lib=framework=CoreAudio");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+    }
     // Linux captures through V4L2, and Windows through DirectShow, both in
     // the same module of the libwebrtc archive.
     if matches!(target_os.as_str(), "linux" | "windows") {
