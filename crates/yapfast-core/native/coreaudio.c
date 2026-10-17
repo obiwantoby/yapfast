@@ -48,6 +48,10 @@ static void fail_status(char *err, size_t length, const char *what, OSStatus sta
 typedef struct {
   uint8_t *data;
   size_t size;
+  /// The size of one frame, so the writer never stores part of one. A partial
+  /// frame leaves `written` off a frame boundary, and every read after it
+  /// returns the samples shifted by those bytes, which is noise and NaN.
+  size_t align;
   size_t written;
   size_t read;
   pthread_mutex_t lock;
@@ -66,9 +70,10 @@ static size_t ring_size(size_t bytes) {
   return size;
 }
 
-static int ring_open(Ring *ring, size_t bytes) {
+static int ring_open(Ring *ring, size_t bytes, size_t align) {
   memset(ring, 0, sizeof(*ring));
   ring->size = ring_size(bytes);
+  ring->align = align > 0 ? align : 1;
   ring->data = calloc(ring->size, 1);
   if (ring->data == NULL) {
     return YAPERR;
@@ -131,6 +136,9 @@ static size_t ring_give(Ring *ring, const uint8_t *in, size_t length) {
   if (put > length) {
     put = length;
   }
+  // Whole frames only, so the read pointer stays on a frame boundary even when
+  // the ring is full and sound is dropped.
+  put -= put % ring->align;
   size_t at = ring->written & (ring->size - 1);
   size_t head = ring->size - at;
   if (head > put) {
@@ -497,7 +505,7 @@ struct YAPOutput *yap_output_open(const char *device_id, uint32_t rate, uint32_t
   if (bytes == 0) {
     bytes = (size_t)(rate / 10) * out->frame_bytes;
   }
-  if (ring_open(&out->ring, bytes + (size_t)io_frames(device) * out->frame_bytes * 4) != YAPOK) {
+  if (ring_open(&out->ring, bytes + (size_t)io_frames(device) * out->frame_bytes * 4, out->frame_bytes) != YAPOK) {
     fail(err, err_length, "out of memory");
     goto failed;
   }
@@ -605,8 +613,41 @@ struct YAPInput {
   /// What the unit renders the microphone into, and how many frames at a time.
   uint8_t *recorded;
   UInt32 recorded_frames;
+  /// What the unit really gives, read back after it was initialised: the
+  /// microphone's own channel count, at whatever rate it settled on. A built-in
+  /// microphone is mono, however stereo the client format was asked for, and
+  /// the unit writes only that much, so everything downstream is measured in
+  /// this rather than in what Yapfast hoped for.
+  uint32_t render_channels;
+  size_t render_frame_bytes;
+  uint32_t render_rate;
+  /// Non-interleaved renders come back one plane per channel and are woven
+  /// into frames before they reach the ring.
+  bool planar;
+  uint8_t *staged;
+  /// Floats at `render_channels`, then at `channels`, waiting to be resampled.
+  float *mapped;
+  size_t mapped_frames;
+  float *resampled;
+  size_t resampled_frames;
+  /// Only when the device settled on another rate than Yapfast asked for.
+  AudioConverterRef converter;
   bool started;
 };
+
+/// Reads the microphone's own format, which is the only honest answer to how
+/// many channels there are.
+static AudioStreamBasicDescription heard_format(AudioDeviceID device) {
+  AudioStreamBasicDescription format;
+  memset(&format, 0, sizeof(format));
+  AudioObjectPropertyAddress address = {kAudioDevicePropertyStreamFormat, kAudioObjectPropertyScopeInput,
+                                        kAudioObjectPropertyElementMain};
+  UInt32 size = sizeof(format);
+  if (AudioObjectGetPropertyData(device, &address, 0, NULL, &size, &format) != noErr) {
+    memset(&format, 0, sizeof(format));
+  }
+  return format;
+}
 
 /// The unit's own thread. It hands over nothing: the microphone is pulled with
 /// AudioUnitRender, into a list of Yapfast's own, and then dropped into the
@@ -624,15 +665,41 @@ static OSStatus record_input(void *context, AudioUnitRenderActionFlags *flags,
   if (frames > in->recorded_frames) {
     frames = in->recorded_frames;
   }
+  size_t bytes = frames * in->render_frame_bytes;
   AudioBufferList list;
-  list.mNumberBuffers = 1;
-  list.mBuffers[0].mNumberChannels = in->channels;
-  list.mBuffers[0].mDataByteSize = frames * (UInt32)in->frame_bytes;
-  list.mBuffers[0].mData = in->recorded;
-  if (AudioUnitRender(in->unit, flags, stamp, 1, frames, &list) != noErr) {
+  // The buffers are sized to what the unit renders, not to what was asked for:
+  // sizing them to the request is how a mono microphone's second channel ends
+  // up in the ring as whatever that memory happened to hold.
+  list.mNumberBuffers = in->planar ? (UInt32)in->render_channels : 1;
+  for (UInt32 at = 0; at < list.mNumberBuffers; at++) {
+    // One plane per channel when the render is planar, one frame-packed buffer
+    // when it isn't, which is what the built-in microphone gives.
+    list.mBuffers[at].mData = in->planar ? in->recorded + (size_t)at * in->recorded_frames * 4
+                                         : in->recorded;
+    list.mBuffers[at].mNumberChannels = in->planar ? 1 : (UInt32)in->render_channels;
+    list.mBuffers[at].mDataByteSize =
+        (UInt32)(in->planar ? (size_t)frames * 4 : bytes);
+  }
+  // A failed render gives back nothing, so the silence written here is what
+  // reaches the uplink rather than the last block twice over.
+  memset(in->recorded, 0, bytes);
+  OSStatus st = AudioUnitRender(in->unit, flags, stamp, 1, frames, &list);
+  if (st != noErr) {
+    ring_give(&in->ring, in->recorded, bytes);
     return noErr;
   }
-  ring_give(&in->ring, list.mBuffers[0].mData, list.mBuffers[0].mDataByteSize);
+  if (!in->planar) {
+    ring_give(&in->ring, in->recorded, bytes);
+    return noErr;
+  }
+  const float *planes = (const float *)in->recorded;
+  float *woven = (float *)in->staged;
+  for (size_t each = 0; each < frames; each++) {
+    for (uint32_t channel = 0; channel < in->render_channels; channel++) {
+      *woven++ = planes[channel * in->recorded_frames + each];
+    }
+  }
+  ring_give(&in->ring, in->staged, bytes);
   return noErr;
 }
 
@@ -699,7 +766,18 @@ struct YAPInput *yap_input_open(const char *device_id, uint32_t rate, uint32_t c
     goto failed;
   }
 
-  AudioStreamBasicDescription format = client_format(rate, channels);
+  // The device side of the bus takes the device's own format, which is what
+  // lets the unit resample at all; the client side then asks for float at that
+  // channel count. Asking for Yapfast's channel count instead is refused, or
+  // quietly answered with the device's, and the difference only shows up as
+  // noise in someone's ear.
+  AudioStreamBasicDescription device_side = heard_format(device);
+  if (device_side.mSampleRate > 0 && device_side.mChannelsPerFrame > 0) {
+    AudioUnitSetProperty(in->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 1, &device_side,
+                         sizeof(device_side));
+  }
+  uint32_t wanted_channels = device_side.mChannelsPerFrame > 0 ? device_side.mChannelsPerFrame : channels;
+  AudioStreamBasicDescription format = client_format(rate, wanted_channels);
   status = AudioUnitSetProperty(in->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1,
                                 &format, sizeof(format));
   if (status != noErr) {
@@ -709,15 +787,6 @@ struct YAPInput *yap_input_open(const char *device_id, uint32_t rate, uint32_t c
   }
   if (status != noErr) {
     fail_status(err, err_length, "that microphone will not take this format", status);
-    goto failed;
-  }
-
-  size_t bytes = (size_t)ring_frames * in->frame_bytes;
-  if (bytes == 0) {
-    bytes = (size_t)(rate / 10) * in->frame_bytes;
-  }
-  if (ring_open(&in->ring, bytes + (size_t)io_frames(device) * in->frame_bytes * 4) != YAPOK) {
-    fail(err, err_length, "out of memory");
     goto failed;
   }
 
@@ -741,12 +810,47 @@ struct YAPInput *yap_input_open(const char *device_id, uint32_t rate, uint32_t c
       slice == 0) {
     slice = io_frames(device);
   }
-  in->recorded = calloc(slice, in->frame_bytes);
-  if (in->recorded == NULL) {
+  // What the unit says it renders is the truth from here.
+  AudioStreamBasicDescription render = client_format(rate, wanted_channels);
+  UInt32 render_size = sizeof(render);
+  if (AudioUnitGetProperty(in->unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &render,
+                           &render_size) == noErr &&
+      render.mChannelsPerFrame > 0) {
+    format = render;
+  }
+  in->render_channels = format.mChannelsPerFrame;
+  in->render_rate = (uint32_t)format.mSampleRate;
+  in->render_frame_bytes = 4 * in->render_channels;
+  in->planar = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0 && in->render_channels > 1;
+  // The ring is measured in what the unit renders, and its alignment is one
+  // frame of that, so this waits until the format is known. Opened against the
+  // wrong frame size, a full ring stores part of a frame and the whole stream
+  // after it arrives shifted by those bytes.
+  size_t bytes = (size_t)ring_frames * in->render_frame_bytes;
+  if (bytes == 0) {
+    bytes = (size_t)(rate / 10) * in->render_frame_bytes;
+  }
+  if (ring_open(&in->ring, bytes + (size_t)io_frames(device) * in->render_frame_bytes * 4,
+                in->render_frame_bytes) != YAPOK) {
+    fail(err, err_length, "out of memory");
+    goto failed;
+  }
+  in->recorded = calloc(in->planar ? (size_t)slice * 4 : (size_t)slice * in->render_frame_bytes, 1);
+  in->staged = calloc((size_t)slice * in->render_frame_bytes, 1);
+  if (in->recorded == NULL || in->staged == NULL) {
     fail(err, err_length, "out of memory");
     goto failed;
   }
   in->recorded_frames = slice;
+  if (in->render_rate != rate && in->render_rate > 0) {
+    // Rare, but a Bluetooth headset settles on 8 or 16 kHz and Yapfast wants
+    // 48. The converter runs where Yapfast does, never in the unit's thread.
+    AudioStreamBasicDescription from = client_format(in->render_rate, channels);
+    AudioStreamBasicDescription to = client_format(rate, channels);
+    if (AudioConverterNew(&from, &to, &in->converter) != noErr) {
+      in->converter = NULL;
+    }
+  }
   status = AudioOutputUnitStart(in->unit);
   if (status != noErr) {
     fail_status(err, err_length, "could not record from that microphone", status);
@@ -780,8 +884,44 @@ static void narrow(const uint8_t *in, uint8_t *out, size_t floats) {
 }
 
 /// Fills `bytes` with what the microphone hears next, waiting for it.
+/// Where the converter's source block is, and how much of it is left to give.
+struct Source {
+  const float *frames;
+  size_t left;
+  uint32_t channels;
+};
+
+/// Hands the converter the block Yapfast just wove together, a little at a time.
+static OSStatus supply(AudioConverterRef converter, UInt32 *frames, AudioBufferList *list,
+                       AudioStreamPacketDescription **descriptions, void *context) {
+  (void)converter;
+  (void)descriptions;
+  struct Source *source = context;
+  UInt32 given = *frames < source->left ? *frames : (UInt32)source->left;
+  list->mNumberBuffers = 1;
+  list->mBuffers[0].mData = (void *)(source->frames + (source->left - given) * source->channels);
+  list->mBuffers[0].mDataByteSize = (UInt32)(given * sizeof(float) * source->channels);
+  *frames = given;
+  source->left -= given;
+  return noErr;
+}
+
+/// Fills `bytes` with what the microphone hears next, waiting for it.
+///
+/// The ring holds the microphone's own layout, so this is where it becomes the
+/// channels and rate Yapfast asked for: the channels are woven together, then
+/// the rate is converted when the device settled on another. Both happen here,
+/// on Yapfast's thread, since neither belongs in the unit's real-time one.
 int yap_input_read(struct YAPInput *in, uint8_t *data, size_t bytes, char *err, size_t err_length) {
-  size_t width = in->float_samples ? bytes : bytes * 2;
+  size_t frames = in->float_samples ? bytes / (4 * in->channels) : bytes / 2;
+  // A device at another rate needs proportionally more of it for the same time.
+  size_t source_frames = in->converter != NULL && in->render_rate > 0
+                             ? frames * in->render_rate / in->rate
+                             : frames;
+  if (source_frames == 0) {
+    source_frames = 1;
+  }
+  size_t width = source_frames * in->render_frame_bytes;
   if (in->scratch_size < width) {
     free(in->scratch);
     in->scratch = malloc(width);
@@ -819,10 +959,56 @@ int yap_input_read(struct YAPInput *in, uint8_t *data, size_t bytes, char *err, 
     }
     got += taken;
   }
+  if (in->mapped_frames < source_frames) {
+    free(in->mapped);
+    in->mapped = calloc(source_frames, in->channels * sizeof(float));
+    in->mapped_frames = in->mapped != NULL ? source_frames : 0;
+    if (in->mapped == NULL) {
+      fail(err, err_length, "out of memory");
+      return YAPERR;
+    }
+  }
+  // A mono microphone's sound goes to both of Yapfast's channels. What goes
+  // there now is the point of this whole function: it used to be whatever sat
+  // in memory after the first channel, which is the static people heard.
+  for (size_t at = 0; at < source_frames; at++) {
+    const float *from = (const float *)in->scratch + at * in->render_channels;
+    for (uint32_t each = 0; each < in->channels; each++) {
+      in->mapped[at * in->channels + each] = from[each < in->render_channels ? each : 0];
+    }
+  }
+  const float *out = in->mapped;
+  if (in->converter != NULL) {
+    if (in->resampled_frames < frames) {
+      free(in->resampled);
+      in->resampled = calloc(frames, in->channels * sizeof(float));
+      in->resampled_frames = in->resampled != NULL ? frames : 0;
+      if (in->resampled == NULL) {
+        fail(err, err_length, "out of memory");
+        return YAPERR;
+      }
+    }
+    struct Source source = {in->mapped, source_frames, in->channels};
+    AudioBufferList filled;
+    filled.mNumberBuffers = 1;
+    filled.mBuffers[0].mNumberChannels = in->channels;
+    filled.mBuffers[0].mData = in->resampled;
+    filled.mBuffers[0].mDataByteSize = (UInt32)(frames * 4 * in->channels);
+    UInt32 made = (UInt32)frames;
+    if (AudioConverterFillComplexBuffer(in->converter, supply, &source, &made, &filled, NULL) != noErr) {
+      made = 0;
+    }
+    // Whatever the converter didn't reach is silence rather than the last
+    // block played twice, which would hum.
+    for (size_t at = made; at < frames * in->channels; at++) {
+      in->resampled[at] = 0.0f;
+    }
+    out = in->resampled;
+  }
   if (in->float_samples) {
-    memcpy(data, in->scratch, bytes);
+    memcpy(data, out, bytes);
   } else {
-    narrow(in->scratch, data, bytes / 2);
+    narrow((const uint8_t *)out, data, frames * in->channels);
   }
   return YAPOK;
 }
@@ -841,5 +1027,11 @@ void yap_input_free(struct YAPInput *in) {
   }
   free(in->scratch);
   free(in->recorded);
+  free(in->staged);
+  free(in->mapped);
+  free(in->resampled);
+  if (in->converter != NULL) {
+    AudioConverterDispose(in->converter);
+  }
   free(in);
 }
