@@ -1,0 +1,31 @@
+# Sourcing this replaces the Nix development shell for a macOS build.
+#
+#   source scripts/macos-env.sh
+#   cargo build --locked --no-default-features --features desktop,discord --profile fast
+#
+# It points Cargo at the libwebrtc archive Yapfast's Go Live codec shims and
+# webrtc-sys both link, so no build script races another to download it.
+# scripts/fetch-libwebrtc-mac downloads and unpacks the archive first.
+
+YAPFAST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+
+# LiveKit's prebuilt libwebrtc for this machine, matching the tag Cargo.lock pins.
+case "$(uname -m)" in
+  arm64) yapfast_triple=mac-arm64 ;;
+  x86_64) yapfast_triple=mac-x64 ;;
+  *) yapfast_triple=mac-arm64 ;;
+esac
+export LK_CUSTOM_WEBRTC="$YAPFAST_ROOT/.local/libwebrtc-$yapfast_triple"
+unset yapfast_triple
+
+# Skia comes from rust-skia's binary cache, which skia-bindings downloads on
+# the first build: the aarch64-apple-darwin archive of the commit 0.153.3 pins.
+# Yapfast pins skia-safe with `no-compile`, so Skia is never built from source
+# here. Set SKIA_BINARIES_URL only to point at a mirror of that archive.
+
+# Clang from the Xcode command line tools builds libwebrtc's C++ bindings.
+export CC=clang
+export CXX=clang++
+
+# The C++ standard library libwebrtc was built against is libc++, which macOS
+# ships; nothing extra to add to LD_LIBRARY_PATH.
