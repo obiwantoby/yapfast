@@ -9,11 +9,12 @@
 
 YAPFAST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
-# LiveKit's prebuilt libwebrtc for this machine, matching the tag Cargo.lock pins.
+# The same triple scripts/fetch-libwebrtc-mac unpacks: os-arch-profile.
+# The profile is release unless LK_DEBUG_WEBRTC=true.
 case "$(uname -m)" in
-  arm64) yapfast_triple=mac-arm64 ;;
-  x86_64) yapfast_triple=mac-x64 ;;
-  *) yapfast_triple=mac-arm64 ;;
+  arm64) yapfast_triple=mac-arm64-release ;;
+  x86_64) yapfast_triple=mac-x64-release ;;
+  *) yapfast_triple=mac-arm64-release ;;
 esac
 export LK_CUSTOM_WEBRTC="$YAPFAST_ROOT/.local/libwebrtc-$yapfast_triple"
 unset yapfast_triple
