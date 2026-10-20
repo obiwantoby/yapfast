@@ -3,14 +3,16 @@
 #   source scripts/macos-env.sh
 #   cargo build --locked --no-default-features --features desktop,discord --profile fast
 #
-# It points Cargo at the libwebrtc archive Yapfast's Go Live codec shims and
-# webrtc-sys both link, so no build script races another to download it.
-# scripts/fetch-libwebrtc-mac downloads and unpacks the archive first.
+# It points Cargo at the libwebrtc archive the Go Live codec shims and
+# webrtc-sys both compile against. The shims read the headers and do not
+# download them, so scripts/fetch-libwebrtc-mac unpacks the archive first.
+# webrtc-sys-build locks its own download. That lock does not help a build
+# script that only reads the directory.
 
 YAPFAST_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 
-# The same triple scripts/fetch-libwebrtc-mac unpacks: os-arch-profile.
-# The profile is release unless LK_DEBUG_WEBRTC=true.
+# The same triple scripts/fetch-libwebrtc-mac unpacks. Release only: this
+# tag has no debug archive, and LK_CUSTOM_WEBRTC overrides a debug triple.
 case "$(uname -m)" in
   arm64) yapfast_triple=mac-arm64-release ;;
   x86_64) yapfast_triple=mac-x64-release ;;

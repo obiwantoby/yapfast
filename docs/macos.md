@@ -5,10 +5,14 @@ Yapfast runs natively on macOS: an Apple Silicon or Intel binary, a real
 notifications. Nothing about the UI is faked — the same Slint interface as
 Linux and Windows, in a Mac window with a Mac icon.
 
-A release build on Apple Silicon sits at about 80 MB of physical footprint
-on the linking screen, measured with `footprint -p`. The README's 40 MB is
-the Linux number. On a Mac the retina framebuffer and CoreAnimation are in
-this process.
+A release build on one M3, idle on the linking screen, was reported at 77 MB
+of physical footprint, and 87 MB on a second run (`footprint -p`). The README's
+40 MB is the Linux claim for doing nothing. The published Discord-only
+Linux sample, software renderer, channel open, is about 66 MiB PSS and 91 MiB
+RSS at 1120×760. Physical
+footprint is a different measure. The window prefers 1120×760. At 2× its
+software pixel buffer is 13.0 MiB, and CoreAnimation's share of the window
+is in this process.
 
 ## Build it
 
@@ -33,8 +37,11 @@ source scripts/macos-env.sh
 cargo run --no-default-features --features desktop,discord
 ```
 
-`scripts/macos-env.sh` points `LK_CUSTOM_WEBRTC` at the libwebrtc under
-`.local/`, so the build scripts don't race each other to download it.
+`scripts/macos-env.sh` points `LK_CUSTOM_WEBRTC` at one libwebrtc under
+`.local/`. `scripts/fetch-libwebrtc-mac` unpacks it before Cargo runs. The
+Go Live codec shims compile against that tree and do not download it.
+`webrtc-sys-build` locks its own download, which does not fill the directory
+for a build script that only reads it.
 
 The first launch from a download asks macOS's permission for the microphone
 when you join a call. Camera access is asked for when you turn a camera on.
