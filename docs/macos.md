@@ -5,6 +5,11 @@ Yapfast runs natively on macOS: an Apple Silicon or Intel binary, a real
 notifications. Nothing about the UI is faked — the same Slint interface as
 Linux and Windows, in a Mac window with a Mac icon.
 
+A release build on Apple Silicon sits at about 80 MB of physical footprint
+on the linking screen, measured with `footprint -p`. The README's 40 MB is
+the Linux number. On a Mac the retina framebuffer and CoreAnimation are in
+this process.
+
 ## Build it
 
 Requires Xcode (or the Command Line Tools), Rust, and a network connection for
