@@ -15,8 +15,11 @@ if [[ -z "$tag" ]]; then
   echo "could not find the libwebrtc tag webrtc-sys-build wants" >&2
   exit 1
 fi
-# os-arch-profile, the name webrtc-sys-build uses. The profile is release
-# unless LK_DEBUG_WEBRTC=true. The zip and the folder inside it share the name.
+# os-arch-release. This tag publishes release archives only. webrtc-sys-build
+# names a debug triple when LK_DEBUG_WEBRTC=true, and that zip is not in the
+# tag. With LK_CUSTOM_WEBRTC set, webrtc_dir() uses this directory and ignores
+# the triple, so the flag does not select different bits. The zip and the
+# folder inside it share the name.
 case "$(uname -m)" in
   arm64) triple=mac-arm64-release ;;
   x86_64) triple=mac-x64-release ;;
