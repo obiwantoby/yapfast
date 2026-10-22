@@ -64,6 +64,11 @@ when you join a call. Camera access is asked for when you turn a camera on.
   writing a launch agent.
 - **Paste from Finder** reads the file URLs on the pasteboard, so copying a
   file in Finder and pasting into a message attaches it.
+- **H.264 decodes through VideoToolbox.** The archive's FFmpeg carries no
+  video decoders on the Mac, so `native/videotoolbox.c` decodes H.264 for both
+  Go Live streams and video files, and takes the hardware's NV12 apart into
+  the I420 planes the rest of Yapfast works in. OpenH264 is in the archive, but
+  only its encoder, so there was nothing else to use.
 - **Audio** uses a CoreAudio HAL unit for both playback and recording, at the
   device's own rate and channel count, resampled into and out of the 48 kHz
   stereo rings the rest of Yapfast uses. WebRTC still mixes, echo-cancels and
@@ -71,20 +76,14 @@ when you join a call. Camera access is asked for when you turn a camera on.
 
 ## Known gaps
 
-- **H.264 video doesn't decode.** The prebuilt libwebrtc for macOS carries
-  FFmpeg's audio decoders and nothing else — FLAC, MP3, Opus, PCM and Vorbis —
-  so `avcodec_find_decoder(AV_CODEC_ID_H264)` answers nothing and a decoder
-  never starts. What the archive does hold works: libvpx decodes VP8 and VP9,
-  dav1d decodes AV1, and OpenH264 encodes H.264, so Go Live sends H.264 but
-  nothing receives it. You lose a remote camera or Go Live stream sent as
-  H.264, and the animated messages Discord sends as `avc1` MP4, which stay on
-  their first frame. OpenH264's decoder isn't in the archive either, only
-  `WelsCreateSVCEncoder`, so this wants VideoToolbox's `VTDecompressionSession`
-  behind `Codec::H264` on macOS. Seven tests fail on this alone, each on an
-  `avc1` fixture: `decode::tests::decodes_the_recorded_streams`,
-  `encode::tests::encodes_h264_that_decodes`, two of `video::tests`,
-  `video_player::tests::plays_a_video_as_it_downloads`, and both animation
-  tests in `ui::pictures`.
+- **AAC sound plays silently.** The archive's FFmpeg decodes FLAC, MP3, Opus,
+  PCM and Vorbis, and not AAC, so an MP4 whose sound is `mp4a` — a screen
+  recording, a clip from a phone — plays without sound. Opening it says so by
+  giving none, and the picture plays on regardless. Two tests fail for this,
+  both on `video-aac.mp4`: `video::tests::plays_pictures_and_sound_and_moves_back`
+  and `video_player::tests::plays_a_video_as_it_downloads`. The Mac has AAC:
+  AudioToolbox's `AudioConverter`, behind the sound path the way
+  `native/videotoolbox.c` is behind the picture one.
 - **Go Live shares the camera, not the whole screen.** Screen CaptureKit
   capture isn't wired up yet, so screen sharing in a Go Live call doesn't
   offer the Mac's display.
