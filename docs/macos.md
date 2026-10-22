@@ -71,6 +71,20 @@ when you join a call. Camera access is asked for when you turn a camera on.
 
 ## Known gaps
 
+- **H.264 video doesn't decode.** The prebuilt libwebrtc for macOS carries
+  FFmpeg's audio decoders and nothing else — FLAC, MP3, Opus, PCM and Vorbis —
+  so `avcodec_find_decoder(AV_CODEC_ID_H264)` answers nothing and a decoder
+  never starts. What the archive does hold works: libvpx decodes VP8 and VP9,
+  dav1d decodes AV1, and OpenH264 encodes H.264, so Go Live sends H.264 but
+  nothing receives it. You lose a remote camera or Go Live stream sent as
+  H.264, and the animated messages Discord sends as `avc1` MP4, which stay on
+  their first frame. OpenH264's decoder isn't in the archive either, only
+  `WelsCreateSVCEncoder`, so this wants VideoToolbox's `VTDecompressionSession`
+  behind `Codec::H264` on macOS. Seven tests fail on this alone, each on an
+  `avc1` fixture: `decode::tests::decodes_the_recorded_streams`,
+  `encode::tests::encodes_h264_that_decodes`, two of `video::tests`,
+  `video_player::tests::plays_a_video_as_it_downloads`, and both animation
+  tests in `ui::pictures`.
 - **Go Live shares the camera, not the whole screen.** Screen CaptureKit
   capture isn't wired up yet, so screen sharing in a Go Live call doesn't
   offer the Mac's display.
@@ -88,6 +102,17 @@ when you join a call. Camera access is asked for when you turn a camera on.
   bytes either way, so nothing can tell which it got. Windows has the same
   collision and renames Skia's copy in `nix/prepare-windows-skia.py`; macOS
   has no such step yet and the warning is safe to ignore.
+- **`__eh_frame` is over the compact unwind limit.** The same link reports
+  that section too large for the compact unwind table, so unwinding falls back
+  to DWARF at runtime. Nothing fails; it's the cost of libwebrtc, Skia and the
+  noise-suppression models in one binary.
+- **Two checks still fail for reasons of their own.**
+  `custom_emoji::tests::skia_draws_the_glyphs_in_colour` can't get a typeface
+  out of `FontMgr::new().new_from_data` on macOS, so the generated colour
+  emoji font is never drawn in the test. And
+  `ui::tests::the_composers_menu_cuts_copies_and_pastes_through_the_application`
+  finds the draft unchanged after Select All then Copy, so what Copy puts on
+  the pasteboard in a headless test never comes back.
 - **Releases aren't notarized here.** The build ad-hoc signs so Gatekeeper
   accepts the app on the machine that built it. Distributing it needs a
   Developer ID and `--notarize`-style notarization, which needs an Apple
