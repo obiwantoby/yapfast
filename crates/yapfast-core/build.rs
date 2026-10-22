@@ -13,9 +13,13 @@ fn main() {
         "picture.c",
         "camera.cc",
         "coreaudio.c",
+        // The Mac's H264 decoder.
+        "videotoolbox.c",
     ] {
         println!("cargo:rerun-if-changed=native/{file}");
     }
+    // decode.c and video.c read it, and cc-rs doesn't watch headers.
+    println!("cargo:rerun-if-changed=native/videotoolbox.h");
     let include = webrtc_sys_build::webrtc_dir().join("include");
     let third_party = include.join("third_party");
     cc::Build::new()
@@ -75,7 +79,8 @@ fn main() {
         Ok("aarch64") => "arm64",
         _ => "x64",
     };
-    cc::Build::new()
+    let mut codecs = cc::Build::new();
+    codecs
         .file("native/vp8.c")
         .file("native/h264.c")
         .file("native/clip.c")
@@ -88,6 +93,15 @@ fn main() {
         .include(third_party.join("libyuv/include"))
         // FFmpeg's configuration for the Chrome build libwebrtc uses.
         .include(third_party.join(format!("ffmpeg/chromium/config/Chrome/{os}/{arch}")))
-        .warnings(true)
-        .compile("yapfast_codecs");
+        .warnings(true);
+    if target_os == "macos" {
+        // The archive's FFmpeg decodes audio and nothing else here, so
+        // VideoToolbox decodes H264. Its frameworks are the system's, so they
+        // add nothing to the binary.
+        codecs.file("native/videotoolbox.c");
+        for framework in ["VideoToolbox", "CoreMedia", "CoreVideo", "CoreFoundation"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
+    codecs.compile("yapfast_codecs");
 }
