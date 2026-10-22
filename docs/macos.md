@@ -76,14 +76,30 @@ when you join a call. Camera access is asked for when you turn a camera on.
 
 ## Known gaps
 
-- **AAC sound plays silently.** The archive's FFmpeg decodes FLAC, MP3, Opus,
-  PCM and Vorbis, and not AAC, so an MP4 whose sound is `mp4a` — a screen
-  recording, a clip from a phone — plays without sound. Opening it says so by
-  giving none, and the picture plays on regardless. Two tests fail for this,
-  both on `video-aac.mp4`: `video::tests::plays_pictures_and_sound_and_moves_back`
-  and `video_player::tests::plays_a_video_as_it_downloads`. The Mac has AAC:
-  AudioToolbox's `AudioConverter`, behind the sound path the way
-  `native/videotoolbox.c` is behind the picture one.
+- **AAC and H264 come from the system, not the archive.** The archive's FFmpeg
+  decodes FLAC, MP3, Opus, PCM and Vorbis, and no video at all, so an MP4 whose
+  sound is `mp4a` and whose picture is `avc1` — a screen recording, a clip from
+  a phone — would otherwise play silently and blank. `native/audio_aac.c` and
+  `native/videotoolbox.c` put AudioToolbox and VideoToolbox behind those two
+  paths. Neither is a packet-in, samples-out decoder, which is what the C shim
+  hides:
+  - An `AudioConverter` fills an output buffer and asks for as many packets as
+    it takes through a callback, and it stops making samples for good once it
+    asks and finds none. So packets queue and go over four at a time, which is
+    also what one call is asked for, and handing them one by one decodes only
+    the first.
+  - It won't take a file's `AudioSpecificConfig` either: setting
+    `kAudioConverterDecompressionMagicCookie` answers `'!dat'` however the
+    config is shaped, and the converter decodes from the rate, the channel
+    count and the packets alone.
+  - A `VTDecompressionSession` hands pictures back in the order it decoded
+    them, not the order they play, and only reorders when the sample's decode
+    time says a later sample presents sooner. `native/videotoolbox.c` reorders
+    them itself, holding four back, because a file's pictures arrive with the
+    times to reorder by but the decoder doesn't use them.
+  - A seek resets both: what either was holding belongs to what came before.
+    The VideoToolbox session itself stays, since a file keeps its parameter
+    sets in `avcC` rather than repeating them in the stream.
 - **Go Live shares the camera, not the whole screen.** Screen CaptureKit
   capture isn't wired up yet, so screen sharing in a Go Live call doesn't
   offer the Mac's display.

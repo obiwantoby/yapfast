@@ -56,6 +56,11 @@ int yapfast_vt_next(struct yapfast_vt *vt, struct yapfast_vt_frame *frame, int64
  * holding to reorder. After this, `yapfast_vt_next` gives up the rest. */
 int yapfast_vt_flush(struct yapfast_vt *vt);
 
+/* Tells the decoder to forget everything: what it's holding to reorder belongs
+ * to what came before, and it's building from a keyframe again. A seek calls
+ * this before it hands over the access units after its target. */
+void yapfast_vt_reset(struct yapfast_vt *vt);
+
 void yapfast_vt_free(struct yapfast_vt *vt);
 
 #endif /* YAPFAST_VIDEOTOOLBOX_H */
