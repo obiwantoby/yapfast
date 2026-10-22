@@ -29,7 +29,15 @@ enum { MAX_SIDE = 8192 };
 /* How many decoded pictures wait for the caller. One is taken per access unit,
  * so this only fills when the decoder lets several out at once; it bounds what
  * a file that never asks for a picture can make Yapfast hold on to. */
-enum { MOST_PENDING = 8 };
+enum { MOST_PENDING = 16 };
+
+/* How many pictures to hold before handing one out. A file's pictures are
+ * decoded out of the order they play, and VideoToolbox hands them back as it
+ * decoded them rather than as they play, so the one waiting longest can only be
+ * given once nothing still to come can jump ahead of it. H264 encoders hold a
+ * few frames for this and no more; four covers the deepest setting in common
+ * use, and a file is buffered well past that by the time it plays. */
+enum { REORDER = 4 };
 
 /* The microseconds a `pts_us` runs per, which is how a picture's time goes
  * into a sample and comes back out of the callback unchanged. */
@@ -58,7 +66,7 @@ struct yapfast_vt {
   CMFormatDescriptionRef format;
   /* The access unit with each NAL unit's length in front of it, which the
    * sample borrows rather than copies. It stays the same buffer until the
-   * decoder is done with the sample, which `wait` settles first. */
+   * decoder is done with the sample, which `settled` sees to first. */
   uint8_t *avcc;
   size_t avcc_size;
   /* What the callback gave back, oldest first, until the caller takes them. */
@@ -69,6 +77,10 @@ struct yapfast_vt {
   uint8_t *i420;
   size_t i420_size;
   int low_delay;
+  /* Whether nothing more will be decoded, so what's waiting can all go out. */
+  int flushed;
+  /* How many access units have gone in, which is their decode order. */
+  uint64_t decoded;
 };
 
 /* Walks one access unit's NAL units, Annex-B or prefixed with their lengths. */
@@ -187,21 +199,31 @@ static void decompressed(void *ref_con, void *source_ref_con, OSStatus status,
    * time and hands it another access unit. */
   if (status != noErr || !image) return;
   CVPixelBufferRef buffer = (CVPixelBufferRef)image;
+  int64_t pts = CMTIME_IS_VALID(presentation) && presentation.timescale
+                    ? CMTimeConvertScale(presentation, PTS_TIMESCALE,
+                                         kCMTimeRoundingMethod_RoundHalfAwayFromZero)
+                          .value
+                    : -1;
   if (vt->pending_count == MOST_PENDING) {
-    /* More than the caller takes: show the newest and let the oldest go. */
+    /* More than the caller takes: the one waiting longest goes, since it's the
+     * one it should have seen already. */
     CVBufferRelease(vt->pending[0]);
-    memmove(&vt->pending[0], &vt->pending[1], (MOST_PENDING - 1) * sizeof vt->pending[0]);
-    memmove(&vt->pending_pts[0], &vt->pending_pts[1],
-            (MOST_PENDING - 1) * sizeof vt->pending_pts[0]);
     vt->pending_count--;
+    for (int index = 0; index < vt->pending_count; index++) {
+      vt->pending[index] = vt->pending[index + 1];
+      vt->pending_pts[index] = vt->pending_pts[index + 1];
+    }
   }
-  vt->pending[vt->pending_count] = CVBufferRetain(buffer);
-  vt->pending_pts[vt->pending_count] =
-      CMTIME_IS_VALID(presentation) && presentation.timescale
-          ? CMTimeConvertScale(presentation, PTS_TIMESCALE,
-                               kCMTimeRoundingMethod_RoundHalfAwayFromZero)
-                .value
-          : -1;
+  /* Where it belongs by when it plays, behind any that play no later than it so
+   * pictures sharing a time keep the order they came in. */
+  int at = vt->pending_count;
+  while (at > 0 && vt->pending_pts[at - 1] > pts) at--;
+  for (int index = vt->pending_count; index > at; index--) {
+    vt->pending[index] = vt->pending[index - 1];
+    vt->pending_pts[index] = vt->pending_pts[index - 1];
+  }
+  vt->pending[at] = CVBufferRetain(buffer);
+  vt->pending_pts[at] = pts;
   vt->pending_count++;
 }
 
@@ -444,6 +466,9 @@ static int fill(struct yapfast_vt *vt, CVPixelBufferRef buffer, struct yapfast_v
  * on it forever. */
 static int take(struct yapfast_vt *vt, struct yapfast_vt_frame *frame, int64_t *out_pts_us) {
   if (!vt->pending_count) return 0;
+  /* A live picture shows as it comes; a file's wait until nothing can still
+   * come in front of them. */
+  if (!vt->low_delay && !vt->flushed && vt->pending_count <= REORDER) return 0;
   CVPixelBufferRef buffer = vt->pending[0];
   int64_t pts = vt->pending_pts[0];
   int got = fill(vt, buffer, frame);
@@ -481,7 +506,12 @@ int yapfast_vt_decode(struct yapfast_vt *vt, const uint8_t *data, size_t size, i
   /* A live stream says nothing about when its pictures play; the sample still
    * wants a time, and nothing reads this one's. */
   CMTime at = CMTimeMake(pts_us >= 0 ? pts_us : 0, PTS_TIMESCALE);
-  CMSampleTimingInfo timing = {CMTimeMake(1, PTS_TIMESCALE), at, kCMTimeInvalid};
+  /* The order they arrived in, which for a file is not the order they play in.
+   * The decoder only puts them right when it can see that a frame decoding
+   * later presents sooner, and it reads that off these two: with both times
+   * the same it has nothing to reorder by, and hands back what it was given. */
+  CMTime decoded = CMTimeMake((int64_t)++vt->decoded, PTS_TIMESCALE);
+  CMSampleTimingInfo timing = {CMTimeMake(1, PTS_TIMESCALE), at, decoded};
   CMSampleBufferRef sample = NULL;
   OSStatus made = CMSampleBufferCreate(kCFAllocatorDefault, block, true, NULL, NULL, vt->format, 1,
                                        1, &timing, 0, NULL, &sample);
@@ -491,7 +521,8 @@ int yapfast_vt_decode(struct yapfast_vt *vt, const uint8_t *data, size_t size, i
   }
   /* A live stream shows each picture as it comes and holds none back for
    * reordering; a file's come out in the order they play. */
-  VTDecodeFrameFlags flags = vt->low_delay ? 0 : kVTDecodeFrame_EnableTemporalProcessing;
+  VTDecodeFrameFlags flags =
+      vt->low_delay ? 0 : kVTDecodeFrame_EnableTemporalProcessing;
   OSStatus status = VTDecompressionSessionDecodeFrame(vt->session, sample, flags, vt, NULL);
   /* What the callback gave back waits for the caller, and this is what makes
    * it safe to write over the access unit the sample borrows. */
@@ -513,5 +544,19 @@ int yapfast_vt_flush(struct yapfast_vt *vt) {
   /* Pictures held for reordering only let go when told nothing more comes. */
   VTDecompressionSessionFinishDelayedFrames(vt->session);
   settled(vt);
+  vt->flushed = 1;
   return 0;
+}
+
+void yapfast_vt_reset(struct yapfast_vt *vt) {
+  if (!vt) return;
+  /* What's held back was for the run of pictures that just ended. The session
+   * stays: a file keeps its parameter sets to itself rather than repeating
+   * them, so there'd be nothing to build another from, and a decoder starts
+   * again on its own at the keyframe a seek lands on. */
+  settled(vt);
+  for (int index = 0; index < vt->pending_count; index++) CVBufferRelease(vt->pending[index]);
+  vt->pending_count = 0;
+  vt->flushed = 0;
+  vt->decoded = 0;
 }

@@ -21,6 +21,7 @@
 
 #ifdef __APPLE__
 #include "videotoolbox.h"
+#include "audio_aac.h"
 #endif
 
 enum { DECODER_AVCODEC, DECODER_VPX, DECODER_DAV1D, DECODER_VIDEOTOOLBOX };
@@ -83,7 +84,16 @@ struct yapfast_video {
 #ifdef __APPLE__
   /* H264, when FFmpeg has no decoder for it. */
   struct yapfast_vt *vt;
+  /* AAC, likewise. */
+  struct yapfast_aac *aac;
+  /* Packets queued for it that haven't been asked about yet, and when the
+   * oldest of them plays. */
+  unsigned aac_queued;
+  int64_t aac_pts;
 #endif
+  /* How many frames of sound receive_sound may be handed; 0 when the decoder
+   * keeps its own buffer. */
+  int sound_capacity;
   /* The picture yapfast_video_next gave last. */
   struct planes planes;
   int sound_stream;
@@ -127,6 +137,7 @@ void yapfast_video_free(struct yapfast_video *video) {
   if (video->vpx_ready) vpx_codec_destroy(&video->vpx);
 #ifdef __APPLE__
   if (video->vt) yapfast_vt_free(video->vt);
+  if (video->aac) yapfast_aac_free(video->aac);
 #endif
   if (video->dav1d) {
     if (video->dav1d_holds) dav1d_picture_unref(&video->dav1d_picture);
@@ -201,6 +212,33 @@ static void open_sound(struct yapfast_video *video) {
   if (stream < 0) return;
   const AVCodecParameters *parameters = video->format->streams[stream]->codecpar;
   const AVCodec *codec = avcodec_find_decoder(parameters->codec_id);
+#ifdef __APPLE__
+  if (!codec && parameters->codec_id == AV_CODEC_ID_AAC) {
+    /* FFmpeg's AAC decoder isn't in the archive here, and AAC is the sound
+     * most video files have, so the system decodes it instead. */
+    int channels = parameters->ch_layout.nb_channels;
+    if (parameters->sample_rate <= 0 || channels <= 0) return;
+    video->aac = yapfast_aac_new((double)parameters->sample_rate, channels, parameters->extradata,
+                                 (size_t)(parameters->extradata_size > 0
+                                              ? parameters->extradata_size
+                                              : 0));
+    if (!video->aac) return;
+    size_t bytes = sizeof(float) * (size_t)YAPFAST_AAC_FRAMES * (size_t)channels;
+    float *samples = realloc(video->samples, bytes);
+    if (!samples) {
+      yapfast_aac_free(video->aac);
+      video->aac = NULL;
+      return;
+    }
+    video->samples = samples;
+    video->samples_size = bytes;
+    video->sound_capacity = YAPFAST_AAC_FRAMES;
+    video->sound_stream = stream;
+    video->sample_rate = parameters->sample_rate;
+    video->channels = channels;
+    return;
+  }
+#endif
   AVCodecContext *context = codec ? avcodec_alloc_context3(codec) : NULL;
   AVFrame *frame = av_frame_alloc();
   if (!context || !frame || avcodec_parameters_to_context(context, parameters) < 0 ||
@@ -437,6 +475,20 @@ static float sample(const AVFrame *frame, int planar, int channels, int channel,
 
 /* Takes the sound decoder's next samples: 1 with some, 0 when it wants data. */
 static int receive_sound(struct yapfast_video *video, int64_t *time_ms) {
+#ifdef __APPLE__
+  if (video->aac) {
+    /* The converter only makes samples from a run of packets at a time, so
+     * they wait until there's one, or until the file has given all it has. */
+    if (video->aac_queued < YAPFAST_AAC_RUN && !video->sent_all) return 0;
+    if (!video->aac_queued) return 0;
+    video->aac_queued = 0;
+    int frames = yapfast_aac_next(video->aac, video->samples, video->sound_capacity);
+    if (frames <= 0) return 0;
+    video->sample_frames = frames;
+    *time_ms = milliseconds(video, video->sound_stream, video->aac_pts);
+    return 1;
+  }
+#endif
   if (!video->sound_context) return 0;
   AVFrame *frame = video->sound_frame;
   av_frame_unref(frame);
@@ -488,7 +540,19 @@ static int feed(struct yapfast_video *video) {
     if (packet->stream_index == video->stream) break;
     if (packet->stream_index == video->sound_stream) {
       /* Damaged sound is left out. */
+#ifdef __APPLE__
+      if (video->aac) {
+        /* The converter takes a run of packets and gives back the samples of
+         * all of them, so they wait until it's asked. */
+        if (!video->aac_queued) video->aac_pts = packet->pts;
+        if (!yapfast_aac_push(video->aac, packet->data, (size_t)packet->size))
+          video->aac_queued++;
+      } else {
+        avcodec_send_packet(video->sound_context, packet);
+      }
+#else
       avcodec_send_packet(video->sound_context, packet);
+#endif
       av_packet_unref(packet);
       return 0;
     }
@@ -623,5 +687,12 @@ int yapfast_video_seek(struct yapfast_video *video, int64_t time_ms) {
   }
   video->planes = (struct planes){0};
   video->sent_all = 0;
+#ifdef __APPLE__
+  /* Both decoders hold work from before the target, and it plays no part in
+   * what comes after it. */
+  if (video->vt) yapfast_vt_reset(video->vt);
+  if (video->aac) yapfast_aac_reset(video->aac);
+  video->aac_queued = 0;
+#endif
   return 0;
 }

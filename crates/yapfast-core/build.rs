@@ -15,11 +15,14 @@ fn main() {
         "coreaudio.c",
         // The Mac's H264 decoder.
         "videotoolbox.c",
+        // And its AAC decoder.
+        "audio_aac.c",
     ] {
         println!("cargo:rerun-if-changed=native/{file}");
     }
-    // decode.c and video.c read it, and cc-rs doesn't watch headers.
+    // decode.c and video.c read them, and cc-rs doesn't watch headers.
     println!("cargo:rerun-if-changed=native/videotoolbox.h");
+    println!("cargo:rerun-if-changed=native/audio_aac.h");
     let include = webrtc_sys_build::webrtc_dir().join("include");
     let third_party = include.join("third_party");
     cc::Build::new()
@@ -95,11 +98,19 @@ fn main() {
         .include(third_party.join(format!("ffmpeg/chromium/config/Chrome/{os}/{arch}")))
         .warnings(true);
     if target_os == "macos" {
-        // The archive's FFmpeg decodes audio and nothing else here, so
-        // VideoToolbox decodes H264. Its frameworks are the system's, so they
+        // The archive's FFmpeg has no video decoders here and no AAC, so the
+        // system decodes both. Its frameworks are already on every Mac, so they
         // add nothing to the binary.
-        codecs.file("native/videotoolbox.c");
-        for framework in ["VideoToolbox", "CoreMedia", "CoreVideo", "CoreFoundation"] {
+        codecs
+            .file("native/videotoolbox.c")
+            .file("native/audio_aac.c");
+        for framework in [
+            "VideoToolbox",
+            "CoreMedia",
+            "CoreVideo",
+            "CoreFoundation",
+            "AudioToolbox",
+        ] {
             println!("cargo:rustc-link-lib=framework={framework}");
         }
     }
