@@ -129,7 +129,8 @@ impl Adapter {
 }
 
 /// What the sidebar was built from, kept to tell whether it changed. The
-/// lists are kept as a hash: copies of them took megabytes on a large account.
+/// rooms and servers go by their count of changes and the other lists by a
+/// hash: copies of them took megabytes on a large account.
 #[derive(PartialEq)]
 pub(super) struct SidebarShown {
     lists: u64,
@@ -141,6 +142,7 @@ pub(super) struct SidebarShown {
     browse_filter: SharedString,
     picture_changes: u64,
     category_changes: u64,
+    list_changes: u64,
     /// Whether Discord took changes, which the header's invite button needs.
     discord_online: bool,
 }
@@ -157,18 +159,20 @@ impl SidebarShown {
             browse_filter: window.get_browse_filter(),
             picture_changes: state.picture_changes,
             category_changes: state.category_changes,
+            list_changes: state.list_changes,
             discord_online: state.discord_online,
         }
     }
 
+    /// The smaller lists the sidebar shows; the rooms and servers count
+    /// their changes.
     fn lists(state: &AppState) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
         (
-            &state.rooms,
-            &state.servers,
             &state.friends,
             &state.friend_requests,
+            &state.discord_blocked,
             &state.pinned,
             &state.browse,
         )
@@ -186,8 +190,56 @@ impl SidebarShown {
             && self.browse_filter == window.get_browse_filter()
             && self.picture_changes == state.picture_changes
             && self.category_changes == state.category_changes
+            && self.list_changes == state.list_changes
             && self.discord_online == state.discord_online
             && self.lists == Self::lists(state)
+    }
+}
+
+impl Icons {
+    /// A conversation's icon, as the sidebar shows it.
+    fn room(&self, room: &yapfast_core::chat::ChatRoom) -> slint::Image {
+        if room.locked {
+            self.lock.clone()
+        } else if room.voice {
+            self.voice.clone()
+        } else if room.forum {
+            self.forum.clone()
+        } else if room.direct {
+            self.dm.clone()
+        } else if room.parent.is_some() {
+            self.thread.clone()
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+/// What the quick switcher listed last, so its places are found again only
+/// once that changes.
+pub(super) struct SwitcherShown {
+    query: String,
+    list_changes: u64,
+    places_used: u64,
+    selected: Option<String>,
+}
+
+impl SwitcherShown {
+    fn of(state: &AppState) -> Self {
+        Self {
+            query: state.switcher.clone().unwrap_or_default(),
+            list_changes: state.list_changes,
+            places_used: state.places_used.changes(),
+            selected: state.selected.clone(),
+        }
+    }
+
+    /// Whether the switcher would list the same.
+    fn shows(&self, state: &AppState) -> bool {
+        state.switcher.as_ref() == Some(&self.query)
+            && self.list_changes == state.list_changes
+            && self.places_used == state.places_used.changes()
+            && self.selected == state.selected
     }
 }
 
@@ -450,7 +502,7 @@ impl Adapter {
         let rooms_by_id: HashMap<&str, &yapfast_core::chat::ChatRoom> = state
             .rooms
             .iter()
-            .map(|room| (room.id.as_str(), room))
+            .map(|room| (room.id.as_str(), &**room))
             .collect();
         self.rail_call = call_room(state).map(str::to_owned);
         let rail = rail(state, &rooms_by_id, &self.layout.open_folders);
@@ -516,6 +568,21 @@ impl Adapter {
         update_model(&self.models.friends_online, around);
         update_model(&self.models.friends, friend_rows);
         window.set_friend_count(i32::try_from(state.friends.len()).unwrap_or(i32::MAX));
+        // Those blocked, for Settings.
+        update_model(
+            &self.models.blocked,
+            state
+                .discord_blocked
+                .iter()
+                .map(|blocked| BlockedRow {
+                    id: blocked.id.as_str().into(),
+                    name: blocked.name.as_str().into(),
+                    username: blocked.username.as_deref().unwrap_or_default().into(),
+                    avatar_url: blocked.avatar.as_deref().unwrap_or_default().into(),
+                    initial: initial(&blocked.name),
+                })
+                .collect(),
+        );
         window.set_friends_open(direct && state.dm_screen == Some(DmScreen::Friends));
         // Browse Channels, at the top of a Community server's channel list;
         // its rows only while it shows, filtered by its search.
@@ -619,17 +686,7 @@ impl Adapter {
                     name: room.name.clone().into(),
                     category: folds_by.unwrap_or(&heading).into(),
                     heading: heading.into(),
-                    icon: if room.locked {
-                        self.icons.lock.clone()
-                    } else if room.voice {
-                        self.icons.voice.clone()
-                    } else if room.forum {
-                        self.icons.forum.clone()
-                    } else if room.direct {
-                        self.icons.dm.clone()
-                    } else {
-                        self.icons.text.clone()
-                    },
+                    icon: self.icons.room(room),
                     selected: Some(&room.id) == state.selected.as_ref(),
                     unread: room.unread > 0,
                     badge: mention_badge(room),
@@ -681,8 +738,9 @@ impl Adapter {
                         ModelRc::new(VecModel::from(people))
                     },
                     call: room.direct && !room.people.is_empty(),
-                    // Discord sends only friends' presence; anyone else in a
-                    // one-to-one DM shows offline, as in Discord's DM list.
+                    // Discord sends the presence of friends and of those
+                    // sharing a server; anyone else in a one-to-one DM shows
+                    // offline, as in Discord's DM list.
                     presence: if room.person.is_some() && room.network == Network::Discord {
                         presence_name(room.presence.or(Some(Presence::Offline)))
                     } else {
@@ -1733,7 +1791,7 @@ impl Adapter {
             .into(),
             saving: dialog.saving,
             error: dialog.error.as_deref().unwrap_or_default().into(),
-            alternative: SharedString::default(),
+            ..Default::default()
         });
     }
 
@@ -1912,21 +1970,29 @@ impl Adapter {
         });
     }
 
-    /// Asks before leaving a Discord server, as Discord's dialog does.
+    /// Asks before leaving a Discord server or group DM, as Discord's
+    /// dialogs do.
     fn show_leave(&self, window: &YapfastWindow) {
         let leave = self.app.state.leave.as_ref();
         window.set_leave_open(leave.is_some());
         let Some(leave) = leave else {
             return;
         };
+        let what = if leave.group { "group" } else { "server" };
         window.set_leave_prompt(ChannelPrompt {
             title: format!("Leave '{}'", leave.name).into(),
             detail: format!(
-                "Are you sure you want to leave {}? You won't be able to rejoin this server unless you are re-invited.",
+                "Are you sure you want to leave {}? You won't be able to rejoin this {what} unless you are re-invited.",
                 leave.name
             )
             .into(),
-            confirm: "Leave server".into(),
+            confirm: format!("Leave {what}").into(),
+            option: if leave.group {
+                "Leave without notifying other members".into()
+            } else {
+                Default::default()
+            },
+            ticked: leave.silent,
             danger: true,
             saving: leave.leaving,
             error: leave.error.as_deref().unwrap_or_default().into(),
@@ -2082,7 +2148,8 @@ impl Adapter {
         });
     }
 
-    /// The dialogs for adding a friend, the custom status, a new DM and forwarding.
+    /// The dialogs for adding a friend, the custom status, a new DM and
+    /// forwarding, and the quick switcher.
     fn show_dialogs(&mut self, window: &YapfastWindow) {
         let state = &self.app.state;
         let add_friend = state.add_friend.as_ref();
@@ -2239,38 +2306,81 @@ impl Adapter {
                 state
                     .forward_places()
                     .into_iter()
-                    .map(|room| {
-                        // A channel shows its server's icon, as Discord's dialog does.
-                        let server = state
-                            .servers
-                            .iter()
-                            .find(|server| !room.direct && server.channels.contains(&room.id));
-                        ForwardRow {
-                            id: room.id.clone().into(),
-                            name: room.name.clone().into(),
-                            place: match server {
-                                _ if room.direct => "Direct message".into(),
-                                Some(server) => server.name.clone().into(),
-                                None => "Channel".into(),
-                            },
-                            icon: if room.direct {
-                                self.icons.dm.clone()
-                            } else {
-                                self.icons.text.clone()
-                            },
-                            avatar: room.direct || server.is_some(),
-                            initial: initial(server.map_or(&room.name, |server| &server.name)),
-                            tint: tint(server.map_or(&room.id, |server| &server.id)),
-                            picture_url: server
-                                .map_or(room.avatar.as_deref(), |server| server.icon.as_deref())
-                                .unwrap_or_default()
-                                .into(),
-                            chosen: forwarding.chosen.contains(&room.id),
-                        }
+                    .map(|room| PlaceRow {
+                        chosen: forwarding.chosen.contains(&room.id),
+                        ..self.place_row(room, true)
                     })
                     .collect()
             }),
         );
+        window.set_switcher_open(state.switcher.is_some());
+        if self
+            .switcher
+            .as_ref()
+            .is_some_and(|shown| shown.shows(state))
+        {
+            return;
+        }
+        self.switcher = state.switcher.as_ref().map(|_| SwitcherShown::of(state));
+        if let Some(query) = &state.switcher
+            && window.get_switcher_query() != query.as_str()
+        {
+            window.set_switcher_query(query.as_str().into());
+        }
+        update_model(
+            &self.models.switcher_places,
+            state
+                .switcher_places()
+                .into_iter()
+                .map(|place| match place {
+                    Place::Room(room) => PlaceRow {
+                        unread: room.unread > 0 && !room.muted,
+                        badge: mention_badge(room),
+                        ..self.place_row(room, false)
+                    },
+                    Place::Server(server) => PlaceRow {
+                        id: server.id.clone().into(),
+                        name: server.name.clone().into(),
+                        place: "Server".into(),
+                        avatar: true,
+                        initial: initial(&server.name),
+                        tint: tint(&server.id),
+                        picture_url: server.icon.clone().unwrap_or_default().into(),
+                        ..PlaceRow::default()
+                    },
+                })
+                .collect(),
+        );
+    }
+
+    /// A conversation as Forward To and the quick switcher list it: a DM by
+    /// its picture, and a channel by its server's icon in Forward To, as
+    /// Discord's dialog shows it, or else by its own.
+    fn place_row(&self, room: &yapfast_core::chat::ChatRoom, server_icon: bool) -> PlaceRow {
+        let state = &self.app.state;
+        let server = state
+            .servers
+            .iter()
+            .find(|server| !room.direct && server.channels.contains(&room.id));
+        let icon = server.filter(|_| server_icon);
+        PlaceRow {
+            id: room.id.clone().into(),
+            name: room.name.clone().into(),
+            place: match server {
+                _ if room.direct => "Direct message".into(),
+                Some(server) => server.name.clone().into(),
+                None => "Channel".into(),
+            },
+            icon: self.icons.room(room),
+            avatar: room.direct || icon.is_some(),
+            initial: initial(icon.map_or(&room.name, |server| &server.name)),
+            tint: tint(icon.map_or(&room.id, |server| &server.id)),
+            picture_url: icon
+                .map_or(room.avatar.as_deref(), |server| server.icon.as_deref())
+                .unwrap_or_default()
+                .into(),
+            ..PlaceRow::default()
+        }
     }
 
     /// The composer: what it may do, its files, its reply or edit, mentions and
@@ -2759,7 +2869,7 @@ impl Adapter {
             let rooms_by_id = state
                 .rooms
                 .iter()
-                .map(|room| (room.id.as_str(), room))
+                .map(|room| (room.id.as_str(), &**room))
                 .collect();
             let rail = rail(state, &rooms_by_id, &self.layout.open_folders);
             update_model_by_id(&self.models.servers, rail, |row| row.id.clone());
@@ -2804,6 +2914,7 @@ impl Adapter {
             voice::Resolution::Source => 2,
         });
         window.set_share_fps(voice.quality.fps as i32);
+        window.set_share_high_quality(voice.quality.high_quality);
         window.set_share_live(
             voice
                 .sharing
@@ -3083,6 +3194,8 @@ impl Adapter {
             frames.push(slint::Image::default());
         }
         self.show_stage(window);
+        self.show_soundboard(window);
+        self.show_soundboard_settings(window);
         let state = &self.app.state;
         let voice = &state.voice;
         window.set_can_film(voice.can_film);
@@ -3131,36 +3244,132 @@ impl Adapter {
             }
         });
         window.set_switch_prompt(prompt.unwrap_or_default().into());
-        update_model(
-            &self.models.microphones,
-            voice
-                .microphones
-                .iter()
-                .map(|device| device_label(&device.name))
-                .collect(),
+        let names = &mut self.models.device_names;
+        let (rows, index) = device_rows(&voice.microphones, voice.microphone.as_deref(), names);
+        update_model(&self.models.microphones, rows);
+        window.set_microphone_index(index);
+        let (rows, index) = device_rows(&voice.speakers, voice.speaker.as_deref(), names);
+        update_model(&self.models.speakers, rows);
+        window.set_speaker_index(index);
+        let (rows, index) = device_rows(&voice.cameras, voice.camera.as_deref(), names);
+        update_model(&self.models.cameras, rows);
+        window.set_camera_index(index);
+    }
+
+    /// The call's soundboard, its rows made again only when its sounds
+    /// change or pictures arrive, and why it can't play, as Discord says.
+    fn show_soundboard(&mut self, window: &YapfastWindow) {
+        let state = &self.app.state;
+        let voice = &state.voice;
+        let groups = voice.soundboard.as_ref().filter(|_| voice.active());
+        window.set_can_soundboard(groups.is_some());
+        let server_muted = voice
+            .participants
+            .iter()
+            .any(|person| person.local && person.server_muted);
+        window.set_soundboard_note(
+            if voice.deafened {
+                "Soundboard disabled when deafened"
+            } else if server_muted {
+                "Soundboard disabled when server muted"
+            } else {
+                ""
+            }
+            .into(),
         );
-        update_model(
-            &self.models.speakers,
-            voice
-                .speakers
+        let Some(groups) = groups else {
+            self.soundboard_shown = None;
+            if self.models.soundboard_rows.row_count() > 0 {
+                self.models.soundboard_rows.set_vec(vec![]);
+            }
+            return;
+        };
+        let shown = self.soundboard_shown.as_ref();
+        if shown.is_some_and(|(kept, revision)| {
+            Arc::ptr_eq(kept, groups) && *revision == state.picture_changes
+        }) {
+            return;
+        }
+        self.soundboard_shown = Some((groups.clone(), state.picture_changes));
+        let rows = sound_rows(groups, &mut self.pictures, state);
+        self.models.soundboard_rows.set_vec(rows);
+    }
+
+    /// Settings' soundboard volume and entrance sounds, while Voice & video
+    /// shows them.
+    fn show_soundboard_settings(&mut self, window: &YapfastWindow) {
+        if !window.get_settings_open() || window.get_settings_section() != 1 {
+            return;
+        }
+        let state = &self.app.state;
+        window.set_discord_nitro(self.app.discord_nitro());
+        if self.soundboard_volume_shown != Some(state.soundboard_volume) {
+            self.soundboard_volume_shown = Some(state.soundboard_volume);
+            let slider = yapfast_core::volume::to_slider(state.soundboard_volume / 100.0);
+            window.set_soundboard_volume(slider.round() as i32);
+        }
+        // Discord's servers by their own ids, which the app's carry after
+        // a prefix.
+        let discord_servers = || {
+            state.servers.iter().filter_map(|server| {
+                Some((yapfast_core::discord::parse_server(&server.id)?, server))
+            })
+        };
+        let same = self.entrance_servers.len() == discord_servers().count() + 1
+            && discord_servers()
+                .zip(self.entrance_servers.iter().skip(1))
+                .all(|((guild, _), kept)| kept.as_deref() == Some(guild));
+        if !same {
+            let servers: Vec<Option<String>> = std::iter::once(None)
+                .chain(discord_servers().map(|(guild, _)| Some(guild.to_owned())))
+                .collect();
+            let names: Vec<SharedString> = std::iter::once("All servers".into())
+                .chain(discord_servers().map(|(_, server)| server.name.as_str().into()))
+                .collect();
+            self.models.entrance_servers.set_vec(names);
+            let chosen = usize::try_from(window.get_entrance_server())
+                .ok()
+                .and_then(|index| self.entrance_servers.get(index).cloned())
+                .flatten();
+            let index = servers
                 .iter()
-                .map(|device| device_label(&device.name))
-                .collect(),
-        );
-        window.set_microphone_index(device_index(
-            &voice.microphones,
-            voice.microphone.as_deref(),
-        ));
-        window.set_speaker_index(device_index(&voice.speakers, voice.speaker.as_deref()));
-        update_model(
-            &self.models.cameras,
-            voice
-                .cameras
-                .iter()
-                .map(|device| device_label(&device.name))
-                .collect(),
-        );
-        window.set_camera_index(device_index(&voice.cameras, voice.camera.as_deref()));
+                .position(|server| *server == chosen)
+                .unwrap_or(0);
+            window.set_entrance_server(index as i32);
+            self.entrance_servers = servers;
+        }
+        let server = usize::try_from(window.get_entrance_server())
+            .ok()
+            .and_then(|index| self.entrance_servers.get(index).cloned())
+            .flatten();
+        let catalog = state.sound_catalog.as_ref();
+        let sound = state
+            .join_sounds
+            .iter()
+            .find(|join| join.server == server)
+            .map(|join| {
+                let named = catalog
+                    .iter()
+                    .flat_map(|groups| groups.iter())
+                    .flat_map(|group| &group.sounds)
+                    .find(|sound| sound.id == join.sound && sound.guild == join.guild);
+                match (named, catalog) {
+                    (Some(sound), _) => sound.name.as_str(),
+                    (None, None) => "Loading...",
+                    (None, Some(_)) => "A sound that's gone",
+                }
+            });
+        window.set_entrance_sound(sound.unwrap_or_default().into());
+        let Some(groups) = catalog else { return };
+        let shown = self.entrance_shown.as_ref();
+        if shown.is_some_and(|(kept, revision)| {
+            Arc::ptr_eq(kept, groups) && *revision == state.picture_changes
+        }) {
+            return;
+        }
+        self.entrance_shown = Some((groups.clone(), state.picture_changes));
+        let rows = sound_rows(groups, &mut self.pictures, state);
+        self.models.entrance_rows.set_vec(rows);
     }
 
     /// The open profile card, and the profile beside a one-to-one DM, with
@@ -4093,4 +4302,47 @@ struct MentionSources {
     found: usize,
     groups: usize,
     color: u32,
+}
+
+/// A soundboard's groups as its rows show them: each group's heading, then
+/// its sounds three to a row.
+fn sound_rows(
+    groups: &[voice::SoundGroup],
+    pictures: &mut HashMap<String, slint::Image>,
+    state: &AppState,
+) -> Vec<SoundRow> {
+    let mut rows = Vec::new();
+    for group in groups {
+        rows.push(SoundRow {
+            heading: group.name.to_uppercase().into(),
+            sounds: ModelRc::default(),
+        });
+        for chunk in group.sounds.chunks(3) {
+            let cells: Vec<SoundCell> = chunk
+                .iter()
+                .map(|sound| SoundCell {
+                    id: sound.id.as_str().into(),
+                    name: sound.name.as_str().into(),
+                    emoji: EmojiCell {
+                        // A custom emoji waits as a quiet square until its
+                        // picture comes.
+                        glyph: if sound.picture.is_some() {
+                            sound.name.as_str().into()
+                        } else {
+                            sound.emoji.as_str().into()
+                        },
+                        name: sound.name.as_str().into(),
+                        key: SharedString::new(),
+                        picture: cached_picture(pictures, state, sound.picture.as_deref()),
+                    },
+                    favorite: sound.favorite,
+                })
+                .collect();
+            rows.push(SoundRow {
+                heading: SharedString::new(),
+                sounds: ModelRc::new(VecModel::from(cells)),
+            });
+        }
+    }
+    rows
 }

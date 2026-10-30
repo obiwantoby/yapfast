@@ -5,6 +5,7 @@ use std::sync::RwLock;
 
 use serde_json::json;
 use yapfast_discord::{
+    marked::{MarkedServer, ServerMarks},
     message::Names,
     ready::{self, permission},
     service::{SharedNames, Snapshot, Status},
@@ -32,7 +33,7 @@ pub fn member_server(alice: &[&str]) -> Application {
         | permission::MUTE_MEMBERS
         | permission::DEAFEN_MEMBERS
         | permission::MOVE_MEMBERS;
-    let mut server = ready::server(&json!({
+    let server = ready::server(&json!({
         "id": "10", "owner_id": "99",
         "properties": {"name": "Test"},
         "roles": [
@@ -56,7 +57,10 @@ pub fn member_server(alice: &[&str]) -> Application {
         ],
     }))
     .unwrap();
-    server.my_roles = alice.iter().map(|role| (*role).to_owned()).collect();
+    let marks = ServerMarks {
+        roles: alice.iter().map(|role| (*role).to_owned()).collect(),
+        ..Default::default()
+    };
     let mut names = Names::default();
     let soon = chrono::Utc::now() + chrono::Duration::hours(1);
     for (user, name, roles, nick, until) in [
@@ -80,8 +84,11 @@ pub fn member_server(alice: &[&str]) -> Application {
     app.apply(Event::Discord(Arc::new(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        servers: vec![Arc::new(server)],
-        friends: vec!["4".into()],
+        servers: vec![MarkedServer {
+            server: Arc::new(server),
+            marks: Arc::new(marks),
+        }],
+        friends: vec!["4".into()].into(),
         friend_list: vec![yapfast_discord::service::Friend {
             user_id: "4".into(),
             name: "Dave".into(),
@@ -90,7 +97,8 @@ pub fn member_server(alice: &[&str]) -> Application {
             presence: None,
             activity: None,
             activities: Default::default(),
-        }],
+        }]
+        .into(),
         names: SharedNames::new(Arc::new(RwLock::new(names))),
         voice: [(
             "12".to_owned(),
@@ -185,6 +193,13 @@ pub fn with_clubs(app: &mut Application) {
     test.put_role(&json!({"id": "10", "name": "@everyone", "position": 0,
         "permissions": bits(permission::VIEW_CHANNEL | permission::SEND_MESSAGES
             | permission::CHANGE_NICKNAME | permission::CREATE_INSTANT_INVITE)}));
-    snapshot.servers = vec![Arc::new(test), Arc::new(club), Arc::new(den)];
+    snapshot.servers = vec![
+        MarkedServer {
+            server: Arc::new(test),
+            marks: snapshot.servers[0].marks.clone(),
+        },
+        club.into(),
+        den.into(),
+    ];
     app.apply(Event::Discord(Arc::new(snapshot)));
 }

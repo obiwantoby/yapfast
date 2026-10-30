@@ -40,6 +40,15 @@ fn reason() -> [u8; REASON] {
     [0; REASON]
 }
 
+/// The microphone or speaker a stream for `id` opens. CoreAudio's names don't
+/// change when a device comes back, so the identifier is the answer; the
+/// default is left empty, since a stream with none follows the system anyway.
+#[cfg(feature = "discord")]
+pub fn endpoint(id: Option<&str>, _: bool) -> String {
+    let Some(id) = id else { return String::new() };
+    id.strip_prefix(crate::voice::NAMED).unwrap_or(id).to_owned()
+}
+
 fn cstr(text: Option<&str>) -> Result<Option<CString>> {
     text.map(CString::new)
         .transpose()

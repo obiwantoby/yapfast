@@ -3,20 +3,20 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     sync::{Arc, RwLock},
 };
 
 use serde_json::Value;
 
 use super::{
-    Account, Conversation, DO_NOT_DISTURB, Friend, FriendRequest, Live, Preview, Snapshot, Status,
-    VoiceMember, VoiceServer,
-    marks::{Marks, Published},
-    now_ms, server,
+    Account, BlockedUser, Conversation, DO_NOT_DISTURB, Friend, FriendRequest, Live, Preview,
+    Snapshot, Status, VoiceMember, VoiceServer, marks::Published, now_ms, server,
 };
 use crate::{
     activity::{self, Activities},
     event::Event,
+    marked::{MarkedServer, ServerMarks},
     member_list::{self, ListedMember, Presence},
     message::{Message, Names},
     ready::{self, PRIVATE, Private, Server},
@@ -32,8 +32,57 @@ const BLOCKED: u64 = 2;
 const INCOMING_REQUEST: u64 = 3;
 const OUTGOING_REQUEST: u64 = 4;
 
+/// The lists of people the last snapshot gave, each kept with a fingerprint
+/// of what made it.
+#[derive(Default)]
+struct Kept {
+    /// By DM id.
+    conversations: HashMap<String, (u64, Arc<Conversation>)>,
+    friends: Option<(u64, Arc<[String]>)>,
+    friend_list: Option<(u64, Arc<[Friend]>)>,
+    blocked: Option<(u64, Arc<[String]>)>,
+    blocked_list: Option<(u64, Arc<[BlockedUser]>)>,
+    ignored: Option<(u64, Arc<[String]>)>,
+    friend_requests: Option<(u64, Arc<[FriendRequest]>)>,
+}
+
+/// The lists of people in a snapshot.
+struct People {
+    conversations: Vec<Arc<Conversation>>,
+    friends: Arc<[String]>,
+    friend_list: Arc<[Friend]>,
+    blocked: Arc<[String]>,
+    blocked_list: Arc<[BlockedUser]>,
+    ignored: Arc<[String]>,
+    friend_requests: Arc<[FriendRequest]>,
+}
+
+/// Whether a DM is muted and unread, its mentions and the last message
+/// read, as [`Unreads::private_marks`] gives them.
+type Marks = (bool, bool, u64, u64);
+
+/// The list `kept` holds when `inputs`, the fingerprint of what makes it,
+/// is the same as when it was made; otherwise a new one.
+fn shared<T: ?Sized>(
+    kept: &mut Option<(u64, Arc<T>)>,
+    inputs: u64,
+    make: impl FnOnce() -> Arc<T>,
+) -> Arc<T> {
+    match kept {
+        Some((last, list)) if *last == inputs => list.clone(),
+        _ => kept.insert((inputs, make())).1.clone(),
+    }
+}
+
+/// A hash of what makes a list, to tell whether it changed.
+fn fingerprint(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// What Discord says of a friend or a DM's person.
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 struct Known {
     presence: Presence,
     /// Their custom status, else what they're doing, on one line.
@@ -71,6 +120,11 @@ pub(super) struct Tracker {
     pub(super) servers: Vec<Arc<Server>>,
     /// Each server as the last snapshot marked it, by id.
     published: HashMap<String, Published>,
+    /// The map [`Self::published`] was before the last snapshot, emptied,
+    /// for the next to fill.
+    emptied: HashMap<String, Published>,
+    /// The lists of people the last snapshot gave.
+    kept: Kept,
     names: Arc<RwLock<Names>>,
     /// Where each user is in voice, by server and user id; DM and group DM
     /// calls go under [`PRIVATE`].
@@ -106,6 +160,9 @@ pub(super) struct Tracker {
     /// the game it shows.
     pub(super) show_game: bool,
     pub(super) playing: Option<Arc<crate::own_activity::Playing>>,
+    /// The soundboard's volume and join sounds, from the settings.
+    soundboard_volume: Option<f32>,
+    join_sounds: Arc<[crate::soundboard::JoinSound]>,
     /// Friend requests by user id: whether each came to this account, whether
     /// Discord took it for spam, and when it was sent.
     requests: HashMap<String, (bool, bool, String)>,
@@ -139,6 +196,8 @@ impl Tracker {
             email: ready["user"]["email"].is_string(),
             servers: ready::servers(ready).into_iter().map(Arc::new).collect(),
             published: HashMap::new(),
+            emptied: HashMap::new(),
+            kept: Kept::default(),
             names,
             voice: HashMap::new(),
             calls: HashMap::new(),
@@ -158,6 +217,8 @@ impl Tracker {
             // As in Discord's apps, until the settings say otherwise.
             show_game: true,
             playing: None,
+            soundboard_volume: None,
+            join_sounds: Arc::from([]),
             requests: HashMap::new(),
             previews: HashMap::new(),
             previews_asked: HashSet::new(),
@@ -185,11 +246,13 @@ impl Tracker {
 
     /// Keeps what `earlier` knew of servers READY gave as unavailable, as it
     /// gives only their ids.
-    pub(super) fn keep_unavailable(&mut self, earlier: &[Arc<Server>]) {
+    pub(super) fn keep_unavailable(&mut self, earlier: &[MarkedServer]) {
         for server in self.servers.iter_mut().filter(|server| server.unavailable) {
             if let Some(known) = earlier.iter().find(|known| known.id == server.id) {
-                let mut known = Server::clone(known);
+                let mut known = Server::clone(&known.server);
                 known.unavailable = true;
+                // The snapshot's copy of a server carries a timeout.
+                known.my_timeout = None;
                 *server = Arc::new(known);
             }
         }
@@ -199,7 +262,7 @@ impl Tracker {
     /// Keeps the thread `channel` of `guild`, on screen, if `earlier` knew
     /// it and READY, which lists only the threads this account is in,
     /// didn't.
-    pub(super) fn keep_thread(&mut self, earlier: &[Arc<Server>], guild: &str, channel: &str) {
+    pub(super) fn keep_thread(&mut self, earlier: &[MarkedServer], guild: &str, channel: &str) {
         let Some(thread) = earlier
             .iter()
             .find(|server| server.id == guild)
@@ -265,6 +328,20 @@ impl Tracker {
                     .flatten()
                 {
                     self.presence(presence["user_id"].as_str(), presence);
+                }
+                // Servers' presences, for the people of DMs who aren't
+                // friends but share a server, as Discord's DM list shows them.
+                for presence in data["merged_presences"]["guilds"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                {
+                    let user = presence["user_id"].as_str();
+                    if user.is_some_and(|user| self.in_private(user)) {
+                        self.presence(user, presence);
+                    }
                 }
                 for guild in data["guilds"].as_array().into_iter().flatten() {
                     let Some(id) = guild["id"].as_str() else {
@@ -506,19 +583,36 @@ impl Tracker {
                 let channel = data["channel_id"].as_str().unwrap_or_default();
                 self.private.iter().any(|private| private.id == channel)
             }
-            // Friends' presences; those in servers go to the member list.
-            Event::PresenceUpdate if data["guild_id"].is_null() => {
+            // Friends' presences, and a server's for the people of DMs; the
+            // member list takes servers' presences too.
+            Event::PresenceUpdate => {
                 let user = data["user"]["id"].as_str();
-                // The DM list shows the person of each one-to-one DM, and the
-                // friends list each friend.
-                self.presence(user, data)
-                    && (self
-                        .friends
+                if !data["guild_id"].is_null() && !user.is_some_and(|user| self.in_private(user)) {
+                    return false;
+                }
+                self.presence(user, data) && self.shows_presence(user)
+            }
+            // A member list's rows carry presences, which the DMs of those
+            // people show too.
+            Event::GuildMemberListUpdate => {
+                let mut changed = false;
+                for op in data["ops"].as_array().into_iter().flatten() {
+                    let items = op["items"].as_array().map_or(&[][..], Vec::as_slice);
+                    for member in items
                         .iter()
-                        .any(|friend| Some(friend.as_str()) == user)
-                        || self.private.iter().any(|private| {
-                            !private.group && private.recipients.first().map(String::as_str) == user
-                        }))
+                        .chain([&op["item"]])
+                        .map(|item| &item["member"])
+                    {
+                        let user = member["user"]["id"].as_str();
+                        if member["presence"].is_object()
+                            && user.is_some_and(|user| self.in_private(user))
+                        {
+                            changed |= self.presence(user, &member["presence"])
+                                && self.shows_presence(user);
+                        }
+                    }
+                }
+                changed
             }
             Event::ChannelCreate | Event::ChannelUpdate | Event::ChannelDelete => {
                 let (Some(guild), Some(id)) = (data["guild_id"].as_str(), data["id"].as_str())
@@ -881,6 +975,24 @@ impl Tracker {
         self.private.push(private);
     }
 
+    /// Whether the snapshot shows `user`'s presence: the DM list shows the
+    /// person of each one-to-one DM, and the friends list each friend.
+    fn shows_presence(&self, user: Option<&str>) -> bool {
+        self.friends
+            .iter()
+            .any(|friend| Some(friend.as_str()) == user)
+            || self.private.iter().any(|private| {
+                !private.group && private.recipients.first().map(String::as_str) == user
+            })
+    }
+
+    /// Whether `user` is in a DM or group DM with this account.
+    fn in_private(&self, user: &str) -> bool {
+        self.private
+            .iter()
+            .any(|private| private.recipients.iter().any(|known| known == user))
+    }
+
     /// Message requests whose latest message is neither known nor asked
     /// for, which count as asked for now. Previews of what's no longer a
     /// request go.
@@ -958,7 +1070,7 @@ impl Tracker {
         true
     }
 
-    /// Learns a friend's presence; returns whether it changed.
+    /// Learns someone's presence; returns whether it changed.
     fn presence(&mut self, user: Option<&str>, data: &Value) -> bool {
         let Some(user) = user else {
             return false;
@@ -1058,6 +1170,13 @@ impl Tracker {
         }
         if let Some(shown) = read.show_game {
             self.show_game = shown;
+        }
+        let soundboard = crate::soundboard::read_settings(encoded);
+        if let Some(volume) = soundboard.volume {
+            self.soundboard_volume = Some(volume);
+        }
+        if let Some(join_sounds) = soundboard.join_sounds {
+            self.join_sounds = join_sounds.into();
         }
         if let Some(list) = settings::server_list(encoded) {
             self.order = list.order;
@@ -1200,6 +1319,58 @@ impl Tracker {
         }
     }
 
+    /// The lists of people a snapshot gives: those that stayed the same
+    /// since the last are shared with it.
+    fn people(&self, names: &Names, kept: &mut Kept) -> People {
+        let friends = shared(&mut kept.friends, fingerprint(&self.friends), || {
+            self.friends.as_slice().into()
+        });
+        let blocked = shared(&mut kept.blocked, fingerprint(&self.blocked), || {
+            self.blocked.as_slice().into()
+        });
+        let ignored = shared(&mut kept.ignored, fingerprint(&self.ignored), || {
+            self.ignored.as_slice().into()
+        });
+        // What each list shows of a person, found as building it would, so
+        // the names it uses stay remembered.
+        let shown = |hasher: &mut DefaultHasher, user: &String| {
+            (user, names.user_name(user), names.avatar_hash(user)).hash(hasher);
+        };
+        let mut hasher = DefaultHasher::new();
+        for user in &self.friends {
+            shown(&mut hasher, user);
+            (self.nicknames.get(user), self.presences.get(user)).hash(&mut hasher);
+        }
+        let friend_list = shared(&mut kept.friend_list, hasher.finish(), || {
+            self.friend_list(names).into()
+        });
+        let mut hasher = DefaultHasher::new();
+        for user in &self.blocked {
+            shown(&mut hasher, user);
+            names.username(user).hash(&mut hasher);
+        }
+        let blocked_list = shared(&mut kept.blocked_list, hasher.finish(), || {
+            self.blocked_list(names).into()
+        });
+        let mut hasher = DefaultHasher::new();
+        for (user, request) in &self.requests {
+            shown(&mut hasher, user);
+            request.hash(&mut hasher);
+        }
+        let friend_requests = shared(&mut kept.friend_requests, hasher.finish(), || {
+            self.friend_requests(names).into()
+        });
+        People {
+            conversations: self.conversations(names, &mut kept.conversations),
+            friends,
+            friend_list,
+            blocked,
+            blocked_list,
+            ignored,
+            friend_requests,
+        }
+    }
+
     /// Friend requests waiting for an answer, incoming then outgoing, the
     /// newest first.
     fn friend_requests(&self, names: &Names) -> Vec<FriendRequest> {
@@ -1244,91 +1415,171 @@ impl Tracker {
         friends
     }
 
-    /// DMs and group DMs, the latest conversation first.
-    fn conversations(&self, names: &Names) -> Vec<Conversation> {
-        let mut private = self.private.clone();
+    /// Those this account blocked, by name.
+    fn blocked_list(&self, names: &Names) -> Vec<BlockedUser> {
+        let mut blocked: Vec<BlockedUser> = self
+            .blocked
+            .iter()
+            .map(|user| {
+                let name = names.user_name(user).unwrap_or("Discord user");
+                BlockedUser {
+                    user_id: user.clone(),
+                    name: name.to_owned(),
+                    // Under their name only when it's a display name.
+                    username: names
+                        .username(user)
+                        .filter(|username| *username != name)
+                        .map(str::to_owned),
+                    avatar: names.avatar(None, user),
+                }
+            })
+            .collect();
+        blocked.sort_by_cached_key(|user| (user.name.to_lowercase(), user.user_id.clone()));
+        blocked
+    }
+
+    /// DMs and group DMs, the latest conversation first. Each one the
+    /// last snapshot gave the same is shared with it.
+    fn conversations(
+        &self,
+        names: &Names,
+        kept: &mut HashMap<String, (u64, Arc<Conversation>)>,
+    ) -> Vec<Arc<Conversation>> {
+        let mut private: Vec<&Private> = self.private.iter().collect();
         // Discord orders by the newest message, or when the DM opened.
         private.sort_by_cached_key(|private| {
             let opened = private.id.parse().unwrap_or_default();
             std::cmp::Reverse(self.unreads.last_message(&private.id).max(opened))
         });
-        private
+        let conversations: Vec<_> = private
             .into_iter()
-            .map(|mut private| {
-                self.unreads.mark_private(&mut private);
-                let name = |user: &String| names.user_name(user).unwrap_or("Discord user");
-                // A friend's DM goes by the nickname this account gave them.
-                let nickname = |user: &String| self.nicknames.get(user).map(String::as_str);
-                let title = match (&private.name, private.recipients.as_slice()) {
-                    (Some(name), _) => name.clone(),
-                    (None, []) if private.group => "Unnamed group".into(),
-                    (None, recipients) if private.group => {
-                        recipients.iter().map(name).collect::<Vec<_>>().join(", ")
+            .map(|private| {
+                let marks = self.unreads.private_marks(&private.id);
+                let inputs = self.conversation_inputs(private, marks, names);
+                let made = || Arc::new(self.conversation(private, marks, names));
+                match kept.get_mut(private.id.as_str()) {
+                    Some((last, conversation)) if *last == inputs => conversation.clone(),
+                    Some(slot) => {
+                        *slot = (inputs, made());
+                        slot.1.clone()
                     }
-                    (None, [user, ..]) => nickname(user).unwrap_or_else(|| name(user)).to_owned(),
-                    (None, []) => "Discord user".into(),
-                };
-                let avatar = if private.group {
-                    private.icon.clone()
-                } else {
-                    private
-                        .recipients
-                        .first()
-                        .map(|user| names.avatar(None, user))
-                };
-                let call = self.calls.contains_key(&private.id);
-                let known = (!private.group)
-                    .then(|| private.recipients.first())
-                    .flatten()
-                    .and_then(|user| self.presences.get(user));
-                let ringing = self
-                    .calls
-                    .get(&private.id)
-                    .into_iter()
-                    .flatten()
-                    .map(|user| VoiceMember {
-                        user_id: user.clone(),
-                        name: name(user).to_owned(),
-                        avatar: names.avatar(None, user),
-                        muted: false,
-                        deafened: false,
-                        server_muted: false,
-                        server_deafened: false,
-                        streaming: false,
-                        video: false,
-                        elsewhere: false,
-                    })
-                    .collect();
-                let preview = private
-                    .request
-                    .then(|| self.previews.get(&private.id).cloned())
-                    .flatten();
-                Conversation {
-                    id: private.id,
-                    name: title,
-                    avatar,
-                    group: private.group,
-                    people: private.recipients.len() + 1,
-                    request: private.request,
-                    spam: private.spam,
-                    person: (!private.group)
-                        .then(|| private.recipients.first().cloned())
-                        .flatten(),
-                    unread: private.unread && !private.spam,
-                    mentions: if private.request { 0 } else { private.mentions },
-                    last_read: private.last_read,
-                    muted: private.muted,
-                    call,
-                    ringing,
-                    presence: known.map(|known| known.presence),
-                    activity: known.and_then(|known| known.activity.clone()),
-                    activities: known
-                        .map(|known| known.activities.clone())
-                        .unwrap_or_default(),
-                    preview,
+                    None => {
+                        let conversation = made();
+                        kept.insert(private.id.clone(), (inputs, conversation.clone()));
+                        conversation
+                    }
                 }
             })
-            .collect()
+            .collect();
+        // Each DM closed leaves one more kept than listed.
+        if kept.len() > conversations.len() {
+            let open: HashSet<&str> = self.private.iter().map(|private| &*private.id).collect();
+            kept.retain(|id, _| open.contains(id.as_str()));
+        }
+        conversations
+    }
+
+    /// A fingerprint of all [`Self::conversation`] reads, found as it
+    /// finds them, so the names it uses stay remembered.
+    fn conversation_inputs(&self, private: &Private, marks: Marks, names: &Names) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        (private, marks).hash(&mut hasher);
+        for user in &private.recipients {
+            names.user_name(user).hash(&mut hasher);
+        }
+        if let Some(user) = private.recipients.first() {
+            (
+                names.avatar_hash(user),
+                self.nicknames.get(user),
+                self.presences.get(user),
+            )
+                .hash(&mut hasher);
+        }
+        let ringing = self.calls.get(&private.id);
+        ringing.is_some().hash(&mut hasher);
+        for user in ringing.into_iter().flatten() {
+            (user, names.user_name(user), names.avatar_hash(user)).hash(&mut hasher);
+        }
+        if private.request {
+            self.previews.get(&private.id).hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// A DM or group DM as the DM list shows it.
+    fn conversation(&self, private: &Private, marks: Marks, names: &Names) -> Conversation {
+        let (muted, unread, mentions, last_read) = marks;
+        let name = |user: &String| names.user_name(user).unwrap_or("Discord user");
+        // A friend's DM goes by the nickname this account gave them.
+        let nickname = |user: &String| self.nicknames.get(user).map(String::as_str);
+        let title = match (&private.name, private.recipients.as_slice()) {
+            (Some(name), _) => name.clone(),
+            (None, []) if private.group => "Unnamed group".into(),
+            (None, recipients) if private.group => {
+                recipients.iter().map(name).collect::<Vec<_>>().join(", ")
+            }
+            (None, [user, ..]) => nickname(user).unwrap_or_else(|| name(user)).to_owned(),
+            (None, []) => "Discord user".into(),
+        };
+        let avatar = if private.group {
+            private.icon.clone()
+        } else {
+            private
+                .recipients
+                .first()
+                .map(|user| names.avatar(None, user))
+        };
+        let call = self.calls.contains_key(&private.id);
+        let known = (!private.group)
+            .then(|| private.recipients.first())
+            .flatten()
+            .and_then(|user| self.presences.get(user));
+        let ringing = self
+            .calls
+            .get(&private.id)
+            .into_iter()
+            .flatten()
+            .map(|user| VoiceMember {
+                user_id: user.clone(),
+                name: name(user).to_owned(),
+                avatar: names.avatar(None, user),
+                muted: false,
+                deafened: false,
+                server_muted: false,
+                server_deafened: false,
+                streaming: false,
+                video: false,
+                elsewhere: false,
+            })
+            .collect();
+        let preview = private
+            .request
+            .then(|| self.previews.get(&private.id).cloned())
+            .flatten();
+        Conversation {
+            id: private.id.clone(),
+            name: title,
+            avatar,
+            group: private.group,
+            people: private.recipients.len() + 1,
+            request: private.request,
+            spam: private.spam,
+            person: (!private.group)
+                .then(|| private.recipients.first().cloned())
+                .flatten(),
+            unread: unread && !private.spam,
+            mentions: if private.request { 0 } else { mentions },
+            last_read,
+            muted,
+            call,
+            ringing,
+            presence: known.map(|known| known.presence),
+            activity: known.and_then(|known| known.activity.clone()),
+            activities: known
+                .map(|known| known.activities.clone())
+                .unwrap_or_default(),
+            preview,
+        }
     }
 
     fn learn_member(&mut self, guild: &str, member: &Value) {
@@ -1433,8 +1684,10 @@ impl Tracker {
             });
         }
         // Mark what this account may do in each channel, reusing the servers
-        // the last snapshot marked the same.
-        let mut published = HashMap::with_capacity(self.servers.len());
+        // and marks the last snapshot published the same. Each moves from
+        // the last snapshot's map to this one's with its id.
+        let mut published = std::mem::take(&mut self.emptied);
+        published.reserve(self.servers.len());
         let mut servers = Vec::with_capacity(self.servers.len());
         let now = now_ms();
         for server in &self.servers {
@@ -1442,43 +1695,64 @@ impl Tracker {
             let timeout = names
                 .timed_out_until(&server.id, &self.me)
                 .filter(|until| *until > now);
-            let last = self.published.remove(&server.id).filter(|last| {
-                Arc::ptr_eq(&last.source, server) && last.roles == roles && last.timeout == timeout
+            let (id, last) = match self.published.remove_entry(&server.id) {
+                Some((id, last)) => (id, Some(last)),
+                None => (server.id.clone(), None),
+            };
+            let last = last.filter(|last| {
+                Arc::ptr_eq(&last.source, server)
+                    && last.listed.marks.roles == roles
+                    && last.timeout == timeout
             });
-            // A timeout in force takes what the account may do away; a
-            // copy of the server carries it while it lasts.
-            let timed_out = timeout.map(|until| Server {
-                my_timeout: Some(ready::Timeout {
-                    user: self.me.clone(),
-                    until,
-                }),
-                ..(**server).clone()
-            });
-            let source = timed_out.as_ref().unwrap_or(server);
             // What the account may do stays while the server, its roles
             // and its timeout do.
-            let marks = match &last {
-                Some(last) => last.marks.unread(source, &self.unreads, now),
-                None => Marks::new(source, &self.me, roles, &self.unreads, now),
+            let listed = match last {
+                Some(last) => {
+                    let MarkedServer { server, marks } = last.listed;
+                    match marks.unread(&server, &self.unreads, now) {
+                        Some(marks) => MarkedServer {
+                            server,
+                            marks: Arc::new(marks),
+                        },
+                        None => MarkedServer { server, marks },
+                    }
+                }
+                None => {
+                    // A timeout in force takes what the account may do
+                    // away; a copy of the server carries it while it lasts.
+                    let server = match timeout {
+                        Some(until) => Arc::new(Server {
+                            my_timeout: Some(ready::Timeout {
+                                user: self.me.clone(),
+                                until,
+                            }),
+                            ..(**server).clone()
+                        }),
+                        None => server.clone(),
+                    };
+                    let marks = ServerMarks::new(&server, &self.me, roles, &self.unreads, now);
+                    MarkedServer {
+                        server,
+                        marks: Arc::new(marks),
+                    }
+                }
             };
-            let (marked, roles) = match last {
-                Some(last) if last.marks == marks => (last.marked, last.roles),
-                Some(last) => (Arc::new(marks.apply(source)), last.roles),
-                None => (Arc::new(marks.apply(source)), roles.to_vec()),
-            };
-            servers.push(marked.clone());
+            servers.push(listed.clone());
             published.insert(
-                server.id.clone(),
+                id,
                 Published {
                     source: server.clone(),
-                    roles,
                     timeout,
-                    marks,
-                    marked,
+                    listed,
                 },
             );
         }
-        self.published = published;
+        // What's left is of servers this account left.
+        self.published.clear();
+        self.emptied = std::mem::replace(&mut self.published, published);
+        let mut kept = std::mem::take(&mut self.kept);
+        let people = self.people(&names, &mut kept);
+        self.kept = kept;
         Snapshot {
             status: Status::Online,
             user_id: Some(self.me.clone()),
@@ -1491,19 +1765,22 @@ impl Tracker {
             }),
             servers,
             folders: self.folders.clone(),
-            conversations: self.conversations(&names),
-            friends: self.friends.clone(),
-            friend_list: self.friend_list(&names),
-            blocked: self.blocked.clone(),
-            ignored: self.ignored.clone(),
+            conversations: people.conversations,
+            friends: people.friends,
+            friend_list: people.friend_list,
+            blocked: people.blocked,
+            blocked_list: people.blocked_list,
+            ignored: people.ignored,
             presence: self.status.clone(),
             custom_status: self
                 .custom_status
                 .clone()
                 .filter(|custom| !custom.expired(now_ms())),
             show_game: self.show_game,
+            soundboard_volume: self.soundboard_volume,
+            join_sounds: self.join_sounds.clone(),
             playing: self.playing.clone(),
-            friend_requests: self.friend_requests(&names),
+            friend_requests: people.friend_requests,
             voice,
             listed: None,
             viewing: self.viewing.iter().chain(&self.beside).cloned().collect(),
@@ -1806,6 +2083,59 @@ mod tests {
     }
 
     #[test]
+    fn a_dm_shows_the_presence_of_a_shared_server() {
+        let ready = json!({
+            "user": {"id": "1", "username": "me"},
+            "users": [{"id": "2", "username": "ann"}, {"id": "3", "username": "cy"}],
+            "private_channels": [{"id": "20", "type": 1, "recipient_ids": ["2"]}],
+        });
+        let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
+        let presence = |tracker: &mut Tracker| tracker.snapshot().conversations[0].presence;
+        tracker.apply(
+            &Event::ReadySupplemental,
+            &json!({"merged_presences": {"friends": [], "guilds": [[
+                {"user_id": "2", "status": "idle"},
+                {"user_id": "3", "status": "online"},
+            ]]}}),
+        );
+        assert_eq!(presence(&mut tracker), Some(Presence::Idle));
+        assert!(
+            !tracker.presences.contains_key("3"),
+            "nobody keeps the presence of a member with no DM"
+        );
+        assert!(tracker.apply(
+            &Event::PresenceUpdate,
+            &json!({"guild_id": "10", "user": {"id": "2"}, "status": "dnd"})
+        ));
+        assert_eq!(presence(&mut tracker), Some(Presence::DoNotDisturb));
+        assert!(
+            !tracker.apply(
+                &Event::PresenceUpdate,
+                &json!({"guild_id": "11", "user": {"id": "2"}, "status": "dnd"})
+            ),
+            "another server's copy changes nothing"
+        );
+        assert!(!tracker.apply(
+            &Event::PresenceUpdate,
+            &json!({"guild_id": "10", "user": {"id": "3"}, "status": "idle"})
+        ));
+        assert!(!tracker.presences.contains_key("3"));
+        let row = |user: &str, status: &str| json!({"member": {"user": {"id": user}, "presence": {"status": status}}});
+        assert!(
+            tracker.apply(
+                &Event::GuildMemberListUpdate,
+                &json!({"guild_id": "10", "id": "everyone", "ops": [
+                    {"op": "SYNC", "range": [0, 99], "items": [{"group": {"id": "online"}}, row("3", "online")]},
+                    {"op": "UPDATE", "index": 4, "item": row("2", "online")},
+                ]}),
+            ),
+            "a member list's row shows in the DM"
+        );
+        assert_eq!(presence(&mut tracker), Some(Presence::Online));
+        assert!(!tracker.presences.contains_key("3"));
+    }
+
+    #[test]
     fn orders_servers_as_the_settings_do() {
         let guild = |id: &str, name: &str, joined: &str| json!({"id": id, "name": name, "joined_at": joined, "channels": [], "roles": []});
         let ready = json!({
@@ -1938,8 +2268,8 @@ mod tests {
             tracker
                 .snapshot()
                 .friend_requests
-                .into_iter()
-                .map(|request| (request.name, request.incoming, request.spam))
+                .iter()
+                .map(|request| (request.name.clone(), request.incoming, request.spam))
                 .collect()
         };
         assert_eq!(
@@ -1963,12 +2293,12 @@ mod tests {
             &json!({"id": "5", "nickname": "x"}),
         );
         assert_eq!(listed(&mut tracker), [("spam".to_owned(), true, true)]);
-        assert_eq!(tracker.snapshot().friends, ["2", "3"]);
+        assert_eq!(*tracker.snapshot().friends, ["2", "3"]);
         let friends: Vec<_> = tracker
             .snapshot()
             .friend_list
-            .into_iter()
-            .map(|friend| (friend.name, friend.presence))
+            .iter()
+            .map(|friend| (friend.name.clone(), friend.presence))
             .collect();
         assert_eq!(
             friends,
@@ -1987,8 +2317,14 @@ mod tests {
 
         // Blocking Ann ends the friendship, and her messages stop notifying.
         tracker.apply(&Event::RelationshipAdd, &json!({"id": "2", "type": 2}));
-        assert_eq!(tracker.snapshot().friends, ["3"]);
-        assert_eq!(tracker.snapshot().blocked, ["2"]);
+        assert_eq!(*tracker.snapshot().friends, ["3"]);
+        assert_eq!(*tracker.snapshot().blocked, ["2"]);
+        let blocked = &tracker.snapshot().blocked_list[0];
+        assert_eq!(
+            (blocked.name.as_str(), blocked.username.as_deref()),
+            ("ann", None),
+            "the blocked list names her, her username once"
+        );
         let from =
             |author: &str| json!({"channel_id": "9", "author": {"id": author}, "content": "hi"});
         assert!(!tracker.notifies(&from("2")));
@@ -2108,7 +2444,7 @@ mod tests {
                 .conversations
                 .into_iter()
                 .filter(|dm| !dm.request)
-                .map(|dm| (dm.name, dm.unread, dm.mentions))
+                .map(|dm| (dm.name.clone(), dm.unread, dm.mentions))
                 .collect()
         };
         assert_eq!(
@@ -2229,7 +2565,7 @@ mod tests {
             .snapshot()
             .conversations
             .into_iter()
-            .map(|dm| (dm.name, dm.request, dm.spam, dm.unread, dm.mentions))
+            .map(|dm| (dm.name.clone(), dm.request, dm.spam, dm.unread, dm.mentions))
             .collect();
         assert_eq!(
             listed,
@@ -2314,9 +2650,8 @@ mod tests {
         let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
         let channels = |tracker: &mut Tracker| -> Vec<String> {
             tracker.snapshot().servers[0]
-                .voice_channels
-                .iter()
-                .filter(|channel| channel.access == ready::Access::Join)
+                .voice_channels()
+                .filter(|channel| channel.marks.access == ready::Access::Join)
                 .map(|channel| channel.name.clone())
                 .collect()
         };
@@ -2359,9 +2694,20 @@ mod tests {
                 until
             })
         );
-        assert_eq!(server.text_channels[0].access, ready::Access::Locked);
-        assert_eq!(server.voice_channels[0].access, ready::Access::Locked);
-        assert!(Arc::ptr_eq(server, &tracker.snapshot().servers[0]));
+        let access = |server: &MarkedServer| {
+            server
+                .text_channels()
+                .chain(server.voice_channels())
+                .map(|channel| channel.marks.access)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(access(server), [ready::Access::Locked; 2]);
+        // The copy that carries the timeout is kept while it lasts.
+        assert_eq!(&tracker.snapshot().servers[0], server);
+        assert!(Arc::ptr_eq(
+            &server.server,
+            &tracker.snapshot().servers[0].server
+        ));
         assert_eq!(tracker.next_quiet(now), Some(until), "published again then");
 
         // Once it ends, what it took comes back.
@@ -2373,8 +2719,7 @@ mod tests {
         let snapshot = tracker.snapshot();
         let server = &snapshot.servers[0];
         assert_eq!(server.my_timeout, None);
-        assert_eq!(server.text_channels[0].access, ready::Access::Join);
-        assert_eq!(server.voice_channels[0].access, ready::Access::Join);
+        assert_eq!(access(server), [ready::Access::Join; 2]);
         assert_eq!(tracker.next_quiet(now), None);
     }
 
@@ -2475,9 +2820,8 @@ mod tests {
         let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
         let quiet = |tracker: &mut Tracker| -> Vec<bool> {
             tracker.snapshot().servers[0]
-                .threads
-                .iter()
-                .map(|thread| thread.thread.as_deref().unwrap().quiet)
+                .threads()
+                .map(|thread| thread.marks.quiet)
                 .collect()
         };
         assert_eq!(quiet(&mut tracker), [true, false]);
@@ -2493,6 +2837,20 @@ mod tests {
         );
         assert_eq!(quiet(&mut tracker), [false, false]);
         assert_eq!(tracker.next_quiet(now), Some(now + 23 * hour));
+    }
+
+    #[test]
+    fn a_media_channel_lists_as_a_forum() {
+        let ready = json!({
+            "user": {"id": "1"},
+            "guilds": [{"id": "10", "properties": {"name": "Test", "owner_id": "1"},
+                "channels": [{"id": "16", "name": "mods", "type": 16, "position": 0}]}],
+            "merged_members": [[{"user_id": "1", "roles": []}]],
+        });
+        let tracker = Tracker::from_ready("1".into(), &ready, Default::default());
+        let channels = &tracker.servers[0].text_channels;
+        assert_eq!(channels.len(), 1);
+        assert!(channels[0].forum.is_some());
     }
 
     #[test]
@@ -2545,15 +2903,14 @@ mod tests {
         let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
         let threads = |tracker: &mut Tracker| -> Vec<(String, bool, ready::Access, bool, u64)> {
             tracker.snapshot().servers[0]
-                .threads
-                .iter()
+                .threads()
                 .map(|thread| {
                     let details = thread.thread.as_deref().unwrap();
                     (
                         thread.id.clone(),
                         details.joined,
-                        thread.access,
-                        thread.unread,
+                        thread.marks.access,
+                        thread.marks.unread,
                         details.messages,
                     )
                 })
@@ -2666,31 +3023,95 @@ mod tests {
             ],
         });
         let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
+        let shared = |one: &MarkedServer, other: &MarkedServer| {
+            (
+                Arc::ptr_eq(&one.server, &other.server),
+                Arc::ptr_eq(&one.marks, &other.marks),
+            )
+        };
         let first = tracker.snapshot();
         let same = tracker.snapshot();
-        assert!(Arc::ptr_eq(&first.servers[0], &same.servers[0]));
-        assert!(Arc::ptr_eq(&first.servers[1], &same.servers[1]));
+        assert_eq!(shared(&first.servers[0], &same.servers[0]), (true, true));
+        assert_eq!(shared(&first.servers[1], &same.servers[1]), (true, true));
 
-        // A message marks one server's channel unread; the other stays shared.
+        // A message marks one server's channel unread: only its marks are
+        // new, and the other server's stay shared.
         tracker.apply(
             &Event::MessageCreate,
             &json!({"id": "900", "channel_id": "21", "guild_id": "20", "author": {"id": "2"}}),
         );
         let unread = tracker.snapshot();
-        assert!(Arc::ptr_eq(&first.servers[0], &unread.servers[0]));
-        assert!(!Arc::ptr_eq(&first.servers[1], &unread.servers[1]));
-        assert!(unread.servers[1].text_channels[0].unread);
-        assert!(
-            !first.servers[1].text_channels[0].unread,
-            "published ones don't change"
-        );
+        assert_eq!(shared(&first.servers[0], &unread.servers[0]), (true, true));
+        assert_eq!(shared(&first.servers[1], &unread.servers[1]), (true, false));
+        let general = |server: &MarkedServer| server.text_channels().next().unwrap().marks.unread;
+        assert!(general(&unread.servers[1]));
+        assert!(!general(&first.servers[1]), "published ones don't change");
 
         // Changing a server copies it rather than the one a snapshot holds.
         tracker.apply(&Event::GuildUpdate, &json!({"id": "10", "name": "Renamed"}));
         let renamed = tracker.snapshot();
         assert_eq!(renamed.servers[0].name, "Renamed");
         assert_eq!(unread.servers[0].name, "One");
-        assert!(Arc::ptr_eq(&unread.servers[1], &renamed.servers[1]));
+        assert_eq!(
+            shared(&unread.servers[1], &renamed.servers[1]),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn snapshots_share_the_dms_and_lists_that_stay_the_same() {
+        let ready = json!({
+            "user": {"id": "1"},
+            "users": [{"id": "2", "username": "ann"}, {"id": "3", "username": "bob"}],
+            "relationships": [{"id": "2", "type": 1}, {"id": "3", "type": 1}],
+            "private_channels": [
+                {"id": "20", "type": 1, "recipient_ids": ["2"]},
+                {"id": "30", "type": 1, "recipient_ids": ["3"]},
+            ],
+        });
+        let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
+        let dm = |snapshot: &Snapshot, id: &str| {
+            let found = snapshot.conversations.iter().find(|dm| dm.id == id);
+            found.unwrap().clone()
+        };
+        let first = tracker.snapshot();
+        let same = tracker.snapshot();
+        assert!(Arc::ptr_eq(&dm(&first, "20"), &dm(&same, "20")));
+        assert!(Arc::ptr_eq(&dm(&first, "30"), &dm(&same, "30")));
+        assert!(Arc::ptr_eq(&first.friends, &same.friends));
+        assert!(Arc::ptr_eq(&first.friend_list, &same.friend_list));
+        assert!(Arc::ptr_eq(&first.friend_requests, &same.friend_requests));
+
+        // Bob going idle changes his DM and the friends list, nothing else.
+        tracker.apply(
+            &Event::PresenceUpdate,
+            &json!({"user": {"id": "3"}, "status": "idle", "activities": []}),
+        );
+        let idle = tracker.snapshot();
+        assert_eq!(dm(&idle, "30").presence, Some(Presence::Idle));
+        assert!(!Arc::ptr_eq(&dm(&first, "30"), &dm(&idle, "30")));
+        assert!(!Arc::ptr_eq(&first.friend_list, &idle.friend_list));
+        assert!(Arc::ptr_eq(&dm(&first, "20"), &dm(&idle, "20")));
+        assert!(Arc::ptr_eq(&first.friends, &idle.friends));
+
+        // A message from Ann marks her DM unread, and only hers.
+        tracker.apply(
+            &Event::MessageCreate,
+            &json!({"id": "900", "channel_id": "20", "author": {"id": "2"}}),
+        );
+        let unread = tracker.snapshot();
+        assert!(dm(&unread, "20").unread);
+        assert!(!dm(&idle, "20").unread, "published ones don't change");
+        assert!(Arc::ptr_eq(&dm(&idle, "30"), &dm(&unread, "30")));
+        assert!(Arc::ptr_eq(&idle.friend_list, &unread.friend_list));
+
+        // A DM closed is forgotten.
+        tracker.apply(
+            &Event::ChannelDelete,
+            &json!({"id": "30", "type": 1, "recipient_ids": ["3"]}),
+        );
+        assert_eq!(tracker.snapshot().conversations.len(), 1);
+        assert_eq!(tracker.kept.conversations.len(), 1);
     }
 
     #[test]
@@ -2704,7 +3125,8 @@ mod tests {
         });
         let mut tracker = Tracker::from_ready("1".into(), &ready, Default::default());
         let marks = |tracker: &mut Tracker| {
-            let voice = &tracker.snapshot().servers[0].voice_channels[0];
+            let snapshot = tracker.snapshot();
+            let voice = snapshot.servers[0].voice_channels().next().unwrap().marks;
             (voice.unread, voice.mentions, voice.last_read)
         };
         assert_eq!(marks(&mut tracker), (true, 1, 700));

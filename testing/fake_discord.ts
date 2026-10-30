@@ -69,9 +69,13 @@
 // "Alice's room", made the first time, on another voice server; POST /_control/stream-move with a stream key
 // moves that stream to another server, and POST
 // /_control/stream-viewer?user=bob has Bob watch Alice's stream (&of=carol
-// Carol's instead; &stop stops him), as STREAM_UPDATE's viewer_ids tell. Watching
+// Carol's instead; &stop stops him), as STREAM_UPDATE's viewer_ids tell; with
+// &decodes=h264,vp8 his client decodes only those, and Alice's stream switches
+// to the most wanted codec every viewer decodes, with op 14, as Discord does,
+// and back when he stops. Watching
 // Bob's stream gets testing/fixtures' recording once the viewer asks for video
-// with op 15: VP8 or, after POST /_control/stream-codec with "h264", H264.
+// with op 15: VP8 or, after POST /_control/stream-codec with "h264", H264;
+// with "h265", H265 to viewers that decode it, and H264 to the rest.
 // Alice has a DM with Bob, whose last two messages she hasn't read, and a
 // group DM, "Weekend plans", with Bob and Carol. POST /_control/dm makes Dave
 // write to her, opening a DM with her the first time, and POST
@@ -127,6 +131,23 @@
 // a moment later in a MESSAGE_UPDATE as Discord's does, a YouTube link and a
 // GIF link, and a bot post a card with fields; their pictures come from
 // /external/, standing in for Discord's media proxy.
+// The soundboard: GET /soundboard-default-sounds gives six of Discord's own,
+// and op 31 "Server"'s two, Bob's laugh with :talk: and Carol's applause.
+// POST /channels/{id}/send-soundboard-sound plays one in the call Alice is in,
+// as Discord checks (not deafened or server muted, a server's sound only in
+// its channels without Nitro), sending everyone VOICE_CHANNEL_EFFECT_SEND; GET
+// /_control/soundboard-sends lists what she sent. The CDN's
+// /soundboard-sounds/ serves Discord's as testing/fixtures' MP3 tone and the
+// server's as its Ogg one. POST /_control/soundboard-play?user=bob&sound=ID
+// has someone play one where they are in voice, the applause unless named,
+// and POST /_control/soundboard-add?name=Bell adds a sound to "Server", with
+// GUILD_SOUNDBOARD_SOUND_CREATE. Alice's favourite sounds, the applause and
+// the airhorn, are in /users/@me/settings-proto/2; her soundboard volume and
+// join sounds in GET /users/@me/settings-proto/1, none set to start with. POST
+// /channels/{id}/custom-call-sounds, as she joins a call with Nitro, plays
+// the join sound her settings give for its server, or for every server, to
+// the others there; GET /_control/custom-call-sounds lists those she asked
+// for.
 // The server has two custom emoji, :talk: and the animated :party:, served
 // from /emojis/, and a sticker from /stickers/. `--nitro` gives Alice Nitro,
 // so every server's emoji are hers to use, and `--cdn-delay MS` makes each
@@ -141,14 +162,15 @@
 // page unfurls into a gifv embed a moment later, a direct link to a GIF's
 // file into an image embed.
 // Alice's custom status, "Testing Yapfast", is in her settings; PATCH
-// /users/@me/settings-proto/1 replaces them, and GET /_control/presence shows the
-// presence her session last sent with op 3. POST /users/@me/relationships sends
+// /users/@me/settings-proto/1 replaces each top-level field it sends, and GET
+// /_control/presence shows the presence her session last sent with op 3. POST /users/@me/relationships sends
 // a friend request by username: Frank takes none, and unknown names fail.
 // From a DM's menu, PUT /users/@me/relationships/{id} with type 2 blocks,
 // DELETE ends a friendship or block, PUT and DELETE .../{id}/ignore ignore and
 // stop, and PATCH gives a friend a nickname. GET and PUT /users/@me/notes/{id}
-// read and write Alice's note on someone, DELETE /channels/{id} closes a DM,
-// and PATCH /users/@me/guilds/@me/settings mutes and unmutes DMs. PATCH
+// read and write Alice's note on someone, DELETE /channels/{id} closes a DM
+// or leaves a group, and GET /_control/group-leaves lists each group left
+// with its `silent` query as sent, and PATCH /users/@me/guilds/@me/settings mutes and unmutes DMs. PATCH
 // /users/@me/guilds/{id}/settings changes her notification settings for a
 // server and its channels, and USER_GUILD_SETTINGS_UPDATE says so; PATCH
 // /users/@me/guilds/settings changes several servers' at once, as Discord's
@@ -403,7 +425,8 @@ const wireGuildSettings = (guild: string) => {
 };
 
 // Alice's settings as Discord keeps them: a protobuf message in base64, of
-// which the fake knows only the status, field 11, holding the custom status.
+// which the fake knows the status, field 11, holding the custom status, and
+// reads the join sounds.
 const protoBytes = (field: number, bytes: Uint8Array) => {
   const out = [field << 3 | 2];
   for (let length = bytes.length; ; length >>= 7) {
@@ -419,6 +442,84 @@ const protoFixed64 = (field: number, value: bigint) => {
   new DataView(out.buffer).setBigUint64(1, value, true);
   return out;
 };
+/** A protobuf message's fields, each its number and, for a length or a
+ *  fixed64, its bytes, else its varint. */
+function protoFields(bytes: Uint8Array): [number, Uint8Array | bigint][] {
+  const fields: [number, Uint8Array | bigint][] = [];
+  let at = 0;
+  const varint = () => {
+    let value = 0n;
+    for (let shift = 0n; ; shift += 7n) {
+      const byte = bytes[at++]!;
+      value |= BigInt(byte & 0x7f) << shift;
+      if (byte < 0x80) return value;
+    }
+  };
+  while (at < bytes.length) {
+    const key = Number(varint());
+    const size = [0, 8, Number.NaN, 0, 0, 4][key & 7];
+    const length = (key & 7) === 2 ? Number(varint()) : size!;
+    if (length === 0) fields.push([key >> 3, varint()]);
+    else fields.push([key >> 3, bytes.slice(at, at += length)]);
+  }
+  return fields;
+}
+/** `patch`'s top-level fields in place of `current`'s of the same
+ *  numbers, as Discord applies a settings PATCH; the rest stay. */
+function mergeSettings(current: string, patch: string): string {
+  const spans = (bytes: Uint8Array) => {
+    const out: [number, Uint8Array][] = [];
+    let at = 0;
+    const varint = () => {
+      let value = 0;
+      for (let shift = 0; ; shift += 7) {
+        const byte = bytes[at++]!;
+        value += (byte & 0x7f) * 2 ** shift;
+        if (byte < 0x80) return value;
+      }
+    };
+    while (at < bytes.length) {
+      const start = at;
+      const key = varint();
+      const wire = key & 7;
+      if (wire === 0) varint();
+      else if (wire === 1) at += 8;
+      else if (wire === 5) at += 4;
+      else { const length = varint(); at += length; }
+      out.push([Math.floor(key / 8), bytes.slice(start, at)]);
+    }
+    return out;
+  };
+  const patched = spans(Buffer.from(patch, "base64"));
+  const replaced = new Set(patched.map(([number]) => number));
+  const kept = spans(Buffer.from(current, "base64")).filter(([number]) => !replaced.has(number));
+  return Buffer.concat([...kept, ...patched].map(([, raw]) => raw)).toString("base64");
+}
+const fixed64 = (bytes: Uint8Array) => new DataView(bytes.buffer, bytes.byteOffset).getBigUint64(0, true);
+
+/** The sound Alice's settings have join `guild`'s calls, the one for every
+ *  server if it has none: [sound, its server or 0n for Discord's own]. */
+function joinSound(guild: string | null): [string, bigint] | undefined {
+  const found = new Map<string, [string, bigint]>();
+  for (const [number, guilds] of protoFields(Buffer.from(settings, "base64"))) {
+    if (number !== 3 || typeof guilds === "bigint") continue;
+    for (const [, entry] of protoFields(guilds).filter(([n]) => n === 1)) {
+      const parts = protoFields(entry as Uint8Array);
+      const key = parts.find(([n]) => n === 1)?.[1];
+      const value = parts.find(([n]) => n === 2)?.[1];
+      if (typeof key === "bigint" || !key || !value || typeof value === "bigint") continue;
+      const sound = protoFields(value).find(([n]) => n === 6)?.[1];
+      if (!sound || typeof sound === "bigint") continue;
+      const ids = protoFields(sound);
+      const id = ids.find(([n]) => n === 1)?.[1];
+      const from = ids.find(([n]) => n === 2)?.[1];
+      if (id instanceof Uint8Array) {
+        found.set(String(fixed64(key)), [String(fixed64(id)), from instanceof Uint8Array ? fixed64(from) : 0n]);
+      }
+    }
+  }
+  return (guild ? found.get(guild) : undefined) ?? found.get("0");
+}
 let settings = Buffer.from(
   protoBytes(11, protoBytes(2, new Uint8Array([...protoBytes(1, text("Testing Yapfast")), ...protoBytes(3, text("🧪"))]))),
 ).toString("base64");
@@ -431,7 +532,9 @@ const bit = (n: number) => 2 ** n;
 // Invite, view, send, embed, attach, read history, react, connect, speak,
 // voice activity, change one's own nickname, make public and private threads
 // and write in them, and post polls: Discord's defaults for @everyone.
-const EVERYONE = [0, 10, 11, 14, 15, 16, 6, 20, 21, 25, 26, 35, 36, 38, 49].reduce((sum, n) => sum + bit(n), 0);
+// Discord's defaults for @everyone, among them using the soundboard (42) and
+// other servers' sounds (45).
+const EVERYONE = [0, 10, 11, 14, 15, 16, 6, 20, 21, 25, 26, 35, 36, 38, 42, 45, 49].reduce((sum, n) => sum + bit(n), 0);
 // Kick, ban, view the audit log, manage nicknames, manage roles, moderate
 // members, and mute, deafen and move members in voice.
 const MODERATION = [1, 2, 7, 27, 28, 40, 22, 23, 24].reduce((sum, n) => sum + bit(n), 0);
@@ -1617,7 +1720,9 @@ const voice = new Map<string, VoiceState>(startingVoice());
 
 // Go Live streams by stream key; Bob's is running from the start. A DM
 // call's streams are keyed `call:{channel}:{user}`.
-type Stream = { viewers: Set<string>; paused: boolean };
+/** `decodes`: the video codecs each viewer's client decodes, for those that
+ * don't decode them all. */
+type Stream = { viewers: Set<string>; paused: boolean; decodes?: Map<string, string[]> };
 const streamKey = (guild: string | null, channel: string, user: string) =>
   guild ? `guild:${guild}:${channel}:${user}` : `call:${channel}:${user}`;
 /** The channel and streamer a stream key names. */
@@ -1888,6 +1993,10 @@ const channelEdits = new Map<string, Partial<GuildChannel>>();
 const deletedChannels = new Set<string>();
 // Each body of PATCH /guilds/{id}/channels, for GET /_control/channel-moves.
 const channelMoves: unknown[] = [];
+
+// Each group DM Alice left, with the `silent` query DELETE /channels/{id}
+// sent, or null, for GET /_control/group-leaves.
+const groupLeaves: { channel: string; silent: string | null }[] = [];
 
 // Whether Alice left "Server"; see DELETE /users/@me/guilds/{id}.
 let leftServer = false;
@@ -2408,7 +2517,12 @@ function readySupplemental() {
       }),
     ],
     merged_presences: {
-      guilds: [[]],
+      // Who in the server is around, Alice aside.
+      guilds: [
+        Object.values(users)
+          .filter((user) => user.id !== ALICE && !removed.has(user.id) && presences[user.id]!.status !== "offline")
+          .map((user) => ({ user_id: user.id, ...presences[user.id] })),
+      ],
       friends: [users.bob, users.carol, users.dave].map((user) => ({ user_id: user.id, ...presences[user.id] })),
     },
     lazy_private_channels: [],
@@ -2790,6 +2904,12 @@ function gatewayMessage(ws: Socket, text: string) {
       });
       break;
     }
+    case 31:
+      // Request soundboard sounds: one SOUNDBOARD_SOUNDS for each server.
+      for (const id of d.guild_ids ?? []) {
+        send(ws, 0, { guild_id: id, soundboard_sounds: id === GUILD ? serverSounds : [] }, "SOUNDBOARD_SOUNDS");
+      }
+      break;
     case 37: {
       // Guild subscriptions: messages are sent anyway; a channel's member
       // list is sent when asked for. The list subscribed to before stops,
@@ -3003,9 +3123,13 @@ type Received = {
   stream: string;
   key: Buffer;
   mode: string;
-  /** The video codec the streamer offered to encode, and its payload type. */
+  /** The video codec Discord chose for the streamer, and its payload type. */
   codec: string;
   payloadType: number;
+  /** The video codecs the streamer offered, most wanted first, and whether
+   * it can encode each; and its stream socket, for op 14. */
+  offers: { name: string; payloadType: number; encode: boolean }[];
+  socket?: { send(text: string): unknown };
   announced: unknown;
   packets: number;
   undecryptable: number;
@@ -3095,8 +3219,9 @@ function ivf(file: Buffer): Recorded {
   return frames;
 }
 
-/** H264 access units from an Annex B stream with access unit delimiters, as lists of NAL units. */
-function annexB(file: Buffer): { units: Buffer[]; keyframe: boolean }[] {
+/** H264 access units from an Annex B stream with access unit delimiters,
+ *  as lists of NAL units; or H265's, with `hevc`. */
+function annexB(file: Buffer, hevc = false): { units: Buffer[]; keyframe: boolean }[] {
   const starts: number[] = [];
   for (let at = 0; at + 3 <= file.length; at++) {
     if (file[at] === 0 && file[at + 1] === 0 && file[at + 2] === 1) starts.push(at + 3);
@@ -3107,17 +3232,66 @@ function annexB(file: Buffer): { units: Buffer[]; keyframe: boolean }[] {
     return file.subarray(start, end);
   });
   const frames: { units: Buffer[]; keyframe: boolean }[] = [];
+  // H264's delimiter is type 9 and its IDR slice 5; H265's delimiter is
+  // type 35, and types 16 to 21 start a picture anew.
+  const [delimiter, isKey] = hevc
+    ? [35, (type: number) => type >= 16 && type <= 21]
+    : [9, (type: number) => type === 5];
   for (const unit of units) {
-    const type = unit[0]! & 0x1f;
-    if (type === 9 || frames.length === 0) frames.push({ units: [], keyframe: false });
-    if (type === 9) continue;
+    const type = hevc ? (unit[0]! >> 1) & 0x3f : unit[0]! & 0x1f;
+    if (type === delimiter || frames.length === 0) frames.push({ units: [], keyframe: false });
+    if (type === delimiter) continue;
     frames.at(-1)!.units.push(unit);
-    if (type === 5) frames.at(-1)!.keyframe = true;
+    if (isKey(type)) frames.at(-1)!.keyframe = true;
   }
   return frames.filter((frame) => frame.units.length > 0);
 }
 
 const voiceTone = oggPackets(readFileSync(new URL("voice-tone.ogg", fixtures)));
+
+// --- Soundboard ---------------------------------------------------------------
+
+type SoundboardSound = {
+  sound_id: string; name: string; volume: number; emoji_id: string | null; emoji_name: string | null;
+  guild_id?: string; user_id: string; available: boolean;
+};
+/** Discord's own sounds, as GET /soundboard-default-sounds gives them. */
+const DEFAULT_SOUNDS: SoundboardSound[] = [
+  ["1", "quack", "🦆"], ["2", "airhorn", "🔊"], ["3", "cricket", "🦗"],
+  ["4", "golf clap", "⛳"], ["5", "sad horn", "🎺"], ["7", "ba dum tss", "🥁"],
+].map(([sound_id, name, emoji_name]) => ({
+  sound_id: sound_id!, name: name!, volume: 1, emoji_id: null, emoji_name: emoji_name!, user_id: "0", available: true,
+}));
+const SOUND_LAUGH = "1400000000000000320";
+const SOUND_APPLAUSE = "1400000000000000321";
+/** "Server"'s sounds: Bob's laugh, with :talk:, and Carol's applause. */
+const serverSounds: SoundboardSound[] = [
+  { sound_id: SOUND_LAUGH, name: "Bob's laugh", volume: 0.8, emoji_id: EMOJI_TALK, emoji_name: "talk", guild_id: GUILD, user_id: users.bob.id, available: true },
+  { sound_id: SOUND_APPLAUSE, name: "Applause", volume: 1, emoji_id: null, emoji_name: "👏", guild_id: GUILD, user_id: users.carol.id, available: true },
+];
+/** What the CDN serves for a sound: Discord's as MP3, the server's as Ogg. */
+const soundFiles = {
+  mp3: readFileSync(new URL("soundboard-tone.mp3", fixtures)),
+  ogg: readFileSync(new URL("voice-tone.ogg", fixtures)),
+};
+/** Sounds Alice played, as she sent them. */
+const soundboardSends: unknown[] = [];
+/** Join sounds Alice asked for: the channel and what she sent. */
+const customCallSounds: unknown[] = [];
+
+/** `user` plays `sound` in the voice channel or DM call they're in, which
+ *  everyone there hears of, as Discord does. */
+function playSound(user: string, sound: SoundboardSound) {
+  const state = voice.get(user);
+  if (!state) return false;
+  dispatch("VOICE_CHANNEL_EFFECT_SEND", {
+    channel_id: state.channel, guild_id: state.guild ?? undefined, user_id: user,
+    sound_id: sound.sound_id, sound_volume: sound.volume,
+    emoji: sound.emoji_name ? { id: sound.emoji_id, name: sound.emoji_name } : null,
+    animation_type: null, animation_id: 0,
+  });
+  return true;
+}
 
 /** Bob says the tone in Alice's call on `ws`, 20 ms a packet, then five
  *  silent frames, marking himself speaking with op 5 first. */
@@ -3304,7 +3478,9 @@ const recordings = {
   vp8: ivf(readFileSync(new URL("stream-vp8.ivf", fixtures))),
   h264: annexB(readFileSync(new URL("stream-h264.h264", fixtures))),
 };
-let streamCodec: "vp8" | "h264" = "vp8";
+/** Bob's recording in H265, for viewers that decode it; an env's video has none. */
+const h265Recording = annexB(readFileSync(new URL("stream-h265.h265", fixtures)), true);
+let streamCodec: "vp8" | "h264" | "h265" = "vp8";
 
 /** A viewer of Bob's stream and what it was sent. */
 type Watcher = {
@@ -3381,7 +3557,8 @@ function streamTo(ws: Socket, key: Buffer, ssrc: number, watcher = watchers.get(
     if (!sent) return;
     const original = Buffer.alloc(2);
     original.writeUInt16BE(number);
-    const rtx = sent.payloadType === 101 ? 102 : 106;
+    // Each video payload type's RTX is the one after it.
+    const rtx = sent.payloadType + 1;
     toViewer(packet(Buffer.concat([original, sent.payload]), sent.marker, sent.timestamp, rtx, ssrc + 1, rtxSequence++));
     watcher.repairs.resent++;
   };
@@ -3407,6 +3584,20 @@ function streamTo(ws: Socket, key: Buffer, ssrc: number, watcher = watchers.get(
         send(Buffer.concat([descriptor, data.subarray(at, at + 1100)]), at + 1100 >= data.length, timestamp, 105);
       }
       picture = (picture + 1) & 0x7fff;
+    } else if (watcher.codec === "h265") {
+      // RFC 7798: whole NAL units, or fragmentation units (type 49) with
+      // the unit's type in their header.
+      const { units } = h265Recording[frame % h265Recording.length]!;
+      units.forEach((unit, index) => {
+        const last = index === units.length - 1;
+        if (unit.length <= 1100) return send(unit, last, timestamp, 103);
+        for (let at = 2; at < unit.length; at += 1100) {
+          const start = at === 2 ? 0x80 : 0;
+          const end = at + 1100 >= unit.length ? 0x40 : 0;
+          const header = Buffer.from([(unit[0]! & 0x81) | (49 << 1), unit[1]!, start | end | ((unit[0]! >> 1) & 0x3f)]);
+          send(Buffer.concat([header, unit.subarray(at, at + 1100)]), last && end !== 0, timestamp, 103);
+        }
+      });
     } else {
       const h264 = camera ?? recorded.h264;
       const { units } = h264[frame % h264.length]!;
@@ -3560,6 +3751,28 @@ function reportCallAudio(call: CallAudio, ssrc: number, key: Buffer, sequence: n
   udp.send(sealRtp(packet, key, call.rtcpCounter++, 8), peer.port, peer.address);
 }
 
+/** A streamer's video codecs from select protocol or session update, most wanted first. */
+function videoOffers(codecs: unknown): Received["offers"] {
+  return ((codecs ?? []) as { name: string; type: string; priority: number; payload_type: number; encode?: boolean }[])
+    .filter((codec) => codec.type === "video")
+    .sort((a, b) => a.priority - b.priority)
+    .map((codec) => ({ name: codec.name, payloadType: codec.payload_type, encode: codec.encode !== false }));
+}
+
+/** Discord's choice of a streamer's codec: the most wanted it can encode
+ * that every viewer decodes, or else its most wanted. A change goes to the
+ * streamer as op 14. */
+function chooseStreamCodec(record: Received) {
+  const stream = streams.get(record.stream);
+  const encodable = record.offers.filter((offer) => offer.encode);
+  const pick = encodable.find((offer) => [...(stream?.viewers ?? [])]
+    .every((id) => stream?.decodes?.get(id)?.includes(offer.name) ?? true)) ?? encodable[0];
+  if (!pick || pick.name === record.codec) return;
+  record.codec = pick.name;
+  record.payloadType = pick.payloadType;
+  record.socket?.send(JSON.stringify({ op: 14, d: { video_codec: pick.name } }));
+}
+
 /** Counts a video packet: frames end with the marker bit; keyframes carry their size. */
 function receiveVideo(packet: Buffer) {
   const ssrc = packet.readUInt32BE(8);
@@ -3580,7 +3793,9 @@ function receiveVideo(packet: Buffer) {
   // Report the first packet lost, as a viewer would, to see it resent.
   if (stream.nacked === null) nack(stream, plain.readUInt16BE(2));
   const payload = plain.subarray(at);
-  const size = stream.codec === "H264" ? h264Keyframe(payload) : vp8Keyframe(payload);
+  const size = stream.codec === "H264" ? h264Keyframe(payload)
+    : stream.codec === "H265" ? h265Keyframe(payload)
+    : vp8Keyframe(payload);
   if (size) {
     stream.keyframes++;
     [stream.width, stream.height] = size;
@@ -3602,6 +3817,62 @@ function vp8Keyframe(payload: Buffer): [number, number] | undefined {
   const start = descriptor & 0x10 && (descriptor & 0x07) === 0;
   if (start && (frame[0]! & 1) === 0 && frame[3] === 0x9d && frame[4] === 0x01 && frame[5] === 0x2a)
     return [frame.readUInt16LE(6) & 0x3fff, frame.readUInt16LE(8) & 0x3fff];
+}
+
+/** The size an H265 packet's sequence parameter set (type 33) gives: whole,
+ * or in an aggregation packet (type 48). */
+function h265Keyframe(payload: Buffer): [number, number] | undefined {
+  const type = (payload[0]! >> 1) & 0x3f;
+  if (type === 33) return h265SpsSize(payload);
+  if (type !== 48) return undefined;
+  for (let at = 2; at + 2 <= payload.length; at += 2 + payload.readUInt16BE(at)) {
+    const unit = payload.subarray(at + 2, at + 2 + payload.readUInt16BE(at));
+    if (((unit[0]! >> 1) & 0x3f) === 33) return h265SpsSize(unit);
+  }
+}
+
+/** Reads the picture size from an H265 SPS (H.265 7.3.2.2.1), less its
+ * conformance window: 4:2:0 encoders code 1080 lines as 1088 and crop 8. */
+function h265SpsSize(nal: Buffer): [number, number] | undefined {
+  const bytes: number[] = [];
+  for (let i = 2; i < nal.length; i++) {
+    if (bytes.length >= 2 && nal[i] === 3 && bytes.at(-1) === 0 && bytes.at(-2) === 0) continue;
+    bytes.push(nal[i]!);
+  }
+  let bit = 0;
+  const read = (count: number) => {
+    let value = 0;
+    for (let i = 0; i < count; i++, bit++) value = value * 2 + ((bytes[bit >> 3]! >> (7 - (bit & 7))) & 1);
+    return value;
+  };
+  const golomb = () => {
+    let zeros = 0;
+    while (read(1) === 0 && zeros < 32) zeros++;
+    return 2 ** zeros - 1 + read(zeros);
+  };
+  read(4); // sps_video_parameter_set_id
+  const subLayers = read(3); // sps_max_sub_layers_minus1
+  read(1);
+  // profile_tier_level: profile, compatibility flags, constraints, level.
+  read(8); read(32); read(48); read(8);
+  const present: [boolean, boolean][] = [];
+  for (let i = 0; i < subLayers; i++) present.push([read(1) === 1, read(1) === 1]);
+  if (subLayers > 0) for (let i = subLayers; i < 8; i++) read(2);
+  for (const [profile, level] of present) {
+    if (profile) { read(8); read(32); read(48); }
+    if (level) read(8);
+  }
+  golomb(); // sps_seq_parameter_set_id
+  const chroma = golomb();
+  if (chroma === 3) read(1);
+  let width = golomb();
+  let height = golomb();
+  if (read(1)) {
+    const [x, y] = chroma === 1 ? [2, 2] : chroma === 2 ? [2, 1] : [1, 1];
+    width -= x * (golomb() + golomb());
+    height -= y * (golomb() + golomb());
+  }
+  return [width, height];
 }
 
 /** The size an H264 packet's sequence parameter set gives: whole, or first in a STAP-A. */
@@ -3773,6 +4044,7 @@ function voiceMessage(ws: Socket, text: string) {
         const record: Received = {
           stream: ws.data.stream, key, mode: d.data?.mode, announced: null,
           codec: offered?.name ?? "VP8", payloadType: offered?.payload_type ?? 105,
+          offers: videoOffers(d.codecs), socket: ws,
           packets: 0, undecryptable: 0, unattached: 0, frames: 0, keyframes: 0, width: 0, height: 0,
           senderReports: 0, reportedPackets: 0,
           audioPackets: 0, audioUndecryptable: 0, audioSenderReports: 0, speaking: null,
@@ -3788,7 +4060,12 @@ function voiceMessage(ws: Socket, text: string) {
         callAudio.set(ws.data.ssrc, { token: ws.data.voiceToken ?? "", packets: 0, undecryptable: 0, silent: 0, voiced: 0, speaking: [], resumed: 0, lost: 0, rtcpCounter: 1 << 20 });
       }
       const watching = ws.data.stream && !ws.data.stream.endsWith(`:${ALICE}`);
-      const codec = watching ? streamCodec : (offered?.name ?? "VP8").toLowerCase();
+      // Discord sends a viewer H265 only when its client decodes it, and
+      // H264 instead, as it chooses for every viewer of a stream.
+      const decodesH265 = ((d.codecs ?? []) as { name: string; decode?: boolean }[])
+        .some((codec) => codec.name === "H265" && codec.decode !== false);
+      const watched = streamCodec === "h265" && !decodesH265 ? "h264" : streamCodec;
+      const codec = watching ? watched : (offered?.name ?? "VP8").toLowerCase();
       reply(4, { mode: d.data?.mode, secret_key: [...key], dave_protocol_version: 0, audio_codec: "opus", video_codec: codec.toUpperCase() });
       if (watching && ws.data.ssrc) {
         // The streamer's SSRCs, as Discord announces another client's video.
@@ -3841,6 +4118,14 @@ function voiceMessage(ws: Socket, text: string) {
       reply(9, null);
       // The session still has the cameras on, sent again once asked for.
       for (const name of filmingFor(ws)) offerCamera(ws, name, false);
+      break;
+    }
+    case 14: { // Session update: the codecs a streamer offers now
+      const record = ws.data.stream && ws.data.ssrc ? received.get(ws.data.ssrc + 1) : undefined;
+      if (record) {
+        record.offers = videoOffers(d.codecs);
+        chooseStreamCodec(record);
+      }
       break;
     }
     case 12: { // Video attributes
@@ -3911,7 +4196,8 @@ function gifsFor(query: string) {
 
 // Alice's second settings, FrecencyUserSettings: her favourite GIFs, two
 // added on another client: one by its page, whose picture is a .gif, and one
-// by a direct link to its file, an animated WebP. PATCH replaces them.
+// by a direct link to its file, an animated WebP, and her favourite sounds.
+// PATCH replaces them.
 function protoNumber(field: number, value: number): Uint8Array {
   const out = [field << 3];
   for (; ; value >>= 7) {
@@ -3934,7 +4220,16 @@ function favoriteGifs(origin: string): string {
       ...entry("https://klipy.com/gifs/hello-9000", `${origin}/_gifs/hello.gif`, 220, 165, 1),
       ...entry(linkedGif("wave", "webp"), `${origin}/_gifs/wave.webp`, 220, 165, 2),
     ]);
-  return Buffer.from(new Uint8Array([...protoBytes(2, gifs), ...placesUsed()])).toString("base64");
+  return Buffer.from(new Uint8Array([...protoBytes(2, gifs), ...placesUsed(), ...favoriteSounds()])).toString("base64");
+}
+
+// Alice's favourite sounds, favorite_soundboard_sounds: the applause, then
+// the airhorn, in the order the picker shows them.
+function favoriteSounds(): Uint8Array {
+  const ids = [SOUND_APPLAUSE, "2"];
+  const packed = new Uint8Array(ids.length * 8);
+  ids.forEach((id, i) => new DataView(packed.buffer).setBigUint64(i * 8, BigInt(id), true));
+  return protoBytes(8, new Uint8Array([...protoBytes(1, packed), ...protoBytes(2, packed)]));
 }
 
 // Alice's guild_and_channel_frecency, which ranks where the Forward To
@@ -4568,6 +4863,50 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     return new Response(null, { status: 204 });
   }
 
+  if (method === "GET" && path === "/soundboard-default-sounds") return json(DEFAULT_SOUNDS);
+
+  // Playing a sound: only in the call Alice is in, neither deafened nor
+  // muted by the server; a server's sound only in its own channels, unless
+  // she has Nitro and may use other servers' sounds there.
+  if (method === "POST" && (m = path.match(/^\/channels\/(\d+)\/send-soundboard-sound$/))) {
+    const body: any = await req.json();
+    soundboardSends.push({ channel: m[1], ...body });
+    const state = voice.get(ALICE);
+    if (state?.channel !== m[1] || state.self_deaf || state.deaf || state.mute) {
+      return json({ message: "Missing Permissions", code: 50013 }, 403);
+    }
+    const own = DEFAULT_SOUNDS.find((sound) => sound.sound_id === body.sound_id && body.source_guild_id === undefined);
+    const server = serverSounds.find((sound) => sound.sound_id === body.sound_id && sound.guild_id === body.source_guild_id);
+    if (!own && !server) return notFound("Unknown Sound", 10097);
+    if (server && server.guild_id !== state.guild && !nitro) return json({ message: "Missing Permissions", code: 50013 }, 403);
+    const channel = state.guild ? guild().channels.find((found: any) => found.id === m![1]) : undefined;
+    const needed = (1n << 21n) | (1n << 42n);
+    if (channel && (alicePermissionsIn(channel) & needed) !== needed) return json({ message: "Missing Permissions", code: 50013 }, 403);
+    playSound(ALICE, (own ?? server)!);
+    return new Response(null, { status: 204 });
+  }
+
+  // A join sound: Alice's, from her settings, played to the call she has
+  // just joined, which needs Nitro and isn't a stage's.
+  if (method === "POST" && (m = path.match(/^\/channels\/(\d+)\/custom-call-sounds$/))) {
+    const body: any = await req.json();
+    customCallSounds.push({ channel: m[1], ...body });
+    const state = voice.get(ALICE);
+    if (state?.channel !== m[1] || !nitro) return json({ message: "Missing Permissions", code: 50013 }, 403);
+    const [id, from] = joinSound(state.guild ?? null) ?? [];
+    const sound = [...DEFAULT_SOUNDS, ...serverSounds]
+      .find((found) => found.sound_id === id && BigInt(found.guild_id ?? 0) === from);
+    if (sound) {
+      dispatch("VOICE_CHANNEL_EFFECT_SEND", {
+        channel_id: state.channel, guild_id: state.guild ?? undefined, user_id: ALICE,
+        sound_id: sound.sound_id, sound_volume: sound.volume,
+        emoji: sound.emoji_name ? { id: sound.emoji_id, name: sound.emoji_name } : null,
+        animation_type: body.animation_type, animation_id: body.animation_id,
+      });
+    }
+    return new Response(null, { status: 204 });
+  }
+
   if (method === "GET" && (m = path.match(/^\/users\/(\d+|@me)\/profile$/))) {
     const user = userById.get(m[1] === "@me" ? ALICE : m[1]!);
     if (!user) return notFound("Unknown User", 10013);
@@ -5198,17 +5537,19 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     return empty();
   }
 
-  // Alice's settings: Yapfast changes the status or the custom status, which
-  // every session hears of. The fake keeps only the latest change.
+  // Alice's settings: Yapfast changes the status, the custom status, the
+  // soundboard's volume or the join sounds, which every session hears of.
+  // Each top-level field sent replaces hers whole, as on Discord.
+  if (method === "GET" && path === "/users/@me/settings-proto/1") return json({ settings });
   if (method === "PATCH" && path === "/users/@me/settings-proto/1") {
     const body: any = await req.json().catch(() => ({}));
     if (typeof body.settings !== "string") return json({ message: "Invalid Form Body", code: 50035 }, 400);
-    settings = body.settings;
-    dispatch("USER_SETTINGS_PROTO_UPDATE", { settings: { type: 1, proto: settings }, partial: true });
+    settings = mergeSettings(settings, body.settings);
+    dispatch("USER_SETTINGS_PROTO_UPDATE", { settings: { type: 1, proto: body.settings }, partial: true });
     return json({ settings });
   }
 
-  // The second settings: favourite GIFs.
+  // The second settings: favourite GIFs and sounds.
   if (method === "GET" && path === "/users/@me/settings-proto/2") {
     return json({ settings: frecencySettings ??= favoriteGifs(origin) });
   }
@@ -5482,10 +5823,12 @@ async function api(req: Request, path: string, origin: string): Promise<Response
     return new Response(null, { status: 204 });
   }
 
-  // Closing a DM takes it out of her list until either of them writes.
+  // Closing a DM takes it out of her list until either of them writes;
+  // leaving a group takes her out of it.
   if (method === "DELETE" && (m = path.match(/^\/channels\/(\d+)$/))) {
     const dm = privates.get(m[1]!);
     if (!dm) return notFound("Unknown Channel", 10003);
+    if (dm.type === 3) groupLeaves.push({ channel: m[1]!, silent: url.searchParams.get("silent") });
     privates.delete(m[1]!);
     const wire = wirePrivate(m[1]!, dm, "objects");
     dispatch("CHANNEL_DELETE", wire);
@@ -6072,13 +6415,13 @@ function postEmbeds(origin: string) {
         type: "rich",
         title: "Server status",
         url: "https://status.example.com",
-        description: "Everything is running. Ask <@" + users.bob.id + "> if something looks off.",
+        description: "## All systems normal\nEverything is running. Ask <@" + users.bob.id + "> if something looks off.\n```\nweb  ok\napi  ok\n```",
         color: 0x57f287,
         fields: [
           { name: "Uptime", value: "**99.98%**", inline: true },
           { name: "Players", value: "42", inline: true },
           { name: "Region", value: "Europe", inline: true },
-          { name: "Notes", value: "Maintenance on Sunday, see https://status.example.com/maintenance", inline: false },
+          { name: "Notes", value: "> Maintenance on Sunday, see https://status.example.com/maintenance", inline: false },
         ],
         footer: { text: "Status Bot" },
         timestamp: iso(now),
@@ -6327,7 +6670,7 @@ const GENERIC_CONTROLS = new Set([
   "stream-move", "sessions", "cookies", "list-requests", "audit-log", "slow", "gateway-reconnect", "qr-scan",
   "qr-confirm", "qr-captcha", "qr-cancel", "qr-expire", "voice-audio", "video", "stream-codec", "reactor-pages",
   "reactor-removals", "thread-searches", "thread-creates", "thread-members", "typed", "acks", "invites",
-  "invite-joins", "invite-captcha", "invite-form", "mfa",
+  "invite-joins", "invite-captcha", "invite-form", "mfa", "soundboard-sends", "custom-call-sounds",
 ]);
 
 /** A status's emoji as the env gives it, Unicode or `<:name:id>`, as Discord sends it. */
@@ -6934,6 +7277,27 @@ const server = Bun.serve<SocketData>({
       }
       return new Response(`${name}'s camera is ${state.self_video ? "on" : "off"} in ${calls.length} call(s)\n`);
     }
+    if (path === "/_control/soundboard-sends") return Response.json(soundboardSends);
+    if (path === "/_control/custom-call-sounds") return Response.json(customCallSounds);
+    if (req.method === "POST" && path === "/_control/soundboard-play") {
+      const who = url.searchParams.get("user") ?? "bob";
+      const user = Object.values(users).find((found) => found.username === who);
+      const id = url.searchParams.get("sound") ?? SOUND_APPLAUSE;
+      const sound = [...DEFAULT_SOUNDS, ...serverSounds].find((found) => found.sound_id === id);
+      if (!user || !sound) return new Response("no such person or sound\n", { status: 400 });
+      return playSound(user.id, sound)
+        ? new Response(`${user.username} played ${sound.name}\n`)
+        : new Response(`${user.username} isn't in voice\n`, { status: 409 });
+    }
+    if (req.method === "POST" && path === "/_control/soundboard-add") {
+      const added: SoundboardSound = {
+        sound_id: snowflake(Date.now(), serverSounds.length), name: url.searchParams.get("name") ?? "New sound",
+        volume: 1, emoji_id: null, emoji_name: "🔔", guild_id: GUILD, user_id: users.bob.id, available: true,
+      };
+      serverSounds.push(added);
+      dispatch("GUILD_SOUNDBOARD_SOUND_CREATE", added);
+      return new Response(`${added.sound_id}\n`);
+    }
     if (req.method === "POST" && path === "/_control/bob-speak") {
       const calls = [...voiceSockets].filter((ws) => !ws.data.stream && ws.data.callKey);
       const spoke = calls.filter((ws) => bobSpeaks(ws)).length;
@@ -6986,8 +7350,16 @@ const server = Bun.serve<SocketData>({
       const found = [...streams.entries()].find(([key]) => key.endsWith(`:${streamer.id}`));
       if (!found) return new Response("no such stream\n", { status: 409 });
       const [key, stream] = found;
-      if (url.searchParams.has("stop")) stream.viewers.delete(viewer.id);
-      else stream.viewers.add(viewer.id);
+      const decodes = url.searchParams.get("decodes")?.toUpperCase().split(",");
+      stream.decodes ??= new Map();
+      if (url.searchParams.has("stop")) {
+        stream.viewers.delete(viewer.id);
+        stream.decodes.delete(viewer.id);
+      } else {
+        stream.viewers.add(viewer.id);
+        if (decodes) stream.decodes.set(viewer.id, decodes);
+      }
+      for (const record of received.values()) if (record.stream === key) chooseStreamCodec(record);
       dispatch("STREAM_UPDATE", wireStream(key, stream));
       return new Response(`${[...stream.viewers].length} watching ${key}\n`);
     }
@@ -7109,7 +7481,7 @@ const server = Bun.serve<SocketData>({
     }
     if (path === "/_control/video") {
       return json({
-        received: [...received.values()].map(({ key: _, ...stream }) => stream),
+        received: [...received.values()].map(({ key: _, socket: _socket, ...stream }) => stream),
         watchers: [...watchers.values()].map(({ timer: _, resend: _resend, repairs: _repairs, ...watcher }) => watcher),
         repairs,
         previews,
@@ -7117,7 +7489,7 @@ const server = Bun.serve<SocketData>({
     }
     if (req.method === "POST" && path === "/_control/stream-codec") {
       const codec = (await req.text()).trim();
-      if (codec !== "vp8" && codec !== "h264") return new Response("vp8 or h264\n", { status: 400 });
+      if (codec !== "vp8" && codec !== "h264" && codec !== "h265") return new Response("vp8, h264 or h265\n", { status: 400 });
       streamCodec = codec;
       return new Response(`streams are ${codec}\n`);
     }
@@ -7128,6 +7500,17 @@ const server = Bun.serve<SocketData>({
     }
     if (req.method === "GET" && path.startsWith("/external/")) {
       return serveExternal(path, url) ?? notFound();
+    }
+    // Discord's CDN: soundboard sounds.
+    const sound = req.method === "GET" ? path.match(/^\/soundboard-sounds\/(\d+)$/) : null;
+    if (sound) {
+      if (DEFAULT_SOUNDS.some((found) => found.sound_id === sound[1])) {
+        return new Response(soundFiles.mp3, { headers: { "content-type": "audio/mpeg" } });
+      }
+      if (serverSounds.some((found) => found.sound_id === sound[1])) {
+        return new Response(soundFiles.ogg, { headers: { "content-type": "audio/ogg" } });
+      }
+      return notFound();
     }
     // Discord's CDN: custom emoji and stickers.
     const emoji = req.method === "GET" ? path.match(/^\/(emojis|stickers)\/(\d+)\.(png|gif|webp)$/) : null;
@@ -7410,6 +7793,9 @@ const server = Bun.serve<SocketData>({
     }
     if (req.method === "GET" && path === "/_control/channel-moves") {
       return Response.json(channelMoves);
+    }
+    if (req.method === "GET" && path === "/_control/group-leaves") {
+      return Response.json(groupLeaves);
     }
     if (req.method === "GET" && path === "/_control/invite-joins") {
       return Response.json(inviteJoins);

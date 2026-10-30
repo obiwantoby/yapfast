@@ -24,7 +24,7 @@ use yapfast_discord::{
 use crate::{
     camera::{self, Camera},
     decode::Decoder,
-    encode::{CLOCK, Encoder},
+    encode::{CLOCK, Effort, Encoder},
     picture::{Feed, I420},
 };
 
@@ -93,9 +93,17 @@ impl Filming {
                 .as_ref()
                 .is_none_or(|encoder| encoder.size() != size);
             if fresh {
-                encoder = Encoder::new(SEND_CODEC, size.0, size.1, camera::FPS, BITRATE)
-                    .inspect_err(|error| tracing::warn!(%error, "could not encode the camera"))
-                    .ok();
+                encoder = Encoder::new(
+                    SEND_CODEC,
+                    size.0,
+                    size.1,
+                    camera::FPS,
+                    BITRATE,
+                    Effort::Light,
+                    false,
+                )
+                .inspect_err(|error| tracing::warn!(%error, "could not encode the camera"))
+                .ok();
             }
             let Some(encoder) = encoder.as_mut() else {
                 return;
@@ -105,6 +113,7 @@ impl Filming {
             match encoder.encode_picture(picture, pts, keyframe) {
                 Ok(Some(frame)) => sender.send(Frame {
                     data: frame.data.to_vec(),
+                    codec: SEND_CODEC,
                     timestamp: pts as u32,
                     keyframe: frame.keyframe,
                 }),

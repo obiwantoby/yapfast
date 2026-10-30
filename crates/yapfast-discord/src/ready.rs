@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::{
     client,
-    forum::{self, Forum, GUILD_FORUM},
-    notifications::{Level, Mute, Notifications},
+    forum::{self, Forum, GUILD_FORUM, GUILD_MEDIA},
+    notifications::{Level, Mute},
 };
 
 /// Discord serves pictures in powers of two; this covers the 80px avatar in a
@@ -49,6 +49,7 @@ pub mod permission {
     pub const MENTION_EVERYONE: u64 = 1 << 17;
     pub const VIEW_GUILD_ANALYTICS: u64 = 1 << 19;
     pub const CONNECT: u64 = 1 << 20;
+    pub const SPEAK: u64 = 1 << 21;
     /// Muting, deafening and moving members in voice channels; moving
     /// takes them out of voice too.
     pub const MUTE_MEMBERS: u64 = 1 << 22;
@@ -67,8 +68,12 @@ pub mod permission {
     pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
     /// Timing members out.
     pub const MODERATE_MEMBERS: u64 = 1 << 40;
+    /// Playing the soundboard's sounds in voice channels, with `SPEAK`.
+    pub const USE_SOUNDBOARD: u64 = 1 << 42;
     /// Adding emoji, stickers and sounds, and changing one's own.
     pub const CREATE_GUILD_EXPRESSIONS: u64 = 1 << 43;
+    /// Playing other servers' sounds, for those with Nitro.
+    pub const USE_EXTERNAL_SOUNDS: u64 = 1 << 45;
     /// Posting polls, besides sending messages.
     pub const SEND_POLLS: u64 = 1 << 49;
     /// Pinning messages and unpinning them, which `MANAGE_MESSAGES` once gave.
@@ -127,7 +132,7 @@ pub struct Server {
     #[serde(default)]
     pub threads: Vec<Channel>,
     // The categories, roles and emoji are shared, as the channels' overwrites
-    // are: a snapshot copies each server to set what's this account's, and
+    // are: a change to the server copies it while a snapshot holds it, and
     // they're most of a large server.
     /// Categories by id, which group and order the channels in them.
     pub categories: Arc<HashMap<String, Category>>,
@@ -159,30 +164,15 @@ pub struct Server {
     #[serde(default)]
     pub verified: bool,
     /// A Community server, where the channel list may list only the
-    /// channels this account follows; see [`Self::follows_only`].
+    /// channels this account follows; see
+    /// [`crate::marked::MarkedServer::follows_only`].
     #[serde(default)]
     pub community: bool,
-    /// Muted in the account's notification settings; set when the service
-    /// publishes it.
-    pub muted: bool,
-    /// This account's roles here, set when the service publishes it.
-    #[serde(default)]
-    pub my_roles: Vec<String>,
-    /// This account's timeout here while it lasts, set when the service
-    /// publishes it.
+    /// This account's timeout here while it lasts, set on a copy of the
+    /// server when the service publishes it; see [`crate::marked`] for the
+    /// rest of what's this account's.
     #[serde(default)]
     pub my_timeout: Option<Timeout>,
-    /// The account's notification settings here keep @everyone and @here,
-    /// and role mentions, from calling on it; set when the service
-    /// publishes it.
-    #[serde(default)]
-    pub suppress_everyone: bool,
-    #[serde(default)]
-    pub suppress_roles: bool,
-    /// This account's notification settings here, shared with the service's
-    /// copy while unchanged; set when the service publishes it.
-    #[serde(default)]
-    pub notifications: Arc<Notifications>,
     /// Its boost level, from 0 to 3, which raises everyone's upload limit
     /// in it; see [`crate::api::upload_limit`].
     pub premium_tier: u8,
@@ -243,21 +233,6 @@ pub struct Channel {
     #[serde(default)]
     pub topic: Option<Arc<str>>,
     pub overwrites: Arc<Vec<Overwrite>>,
-    /// What this account may do here, and the rest below, are set when the
-    /// service publishes it.
-    pub access: Access,
-    /// This account may mention @everyone, @here and every role here; set when
-    /// the service publishes it.
-    pub mention_everyone: bool,
-    /// A text channel with messages this account hasn't read.
-    pub unread: bool,
-    /// Unread messages that mention this account.
-    pub mentions: u64,
-    /// Muted, directly or through its category.
-    pub muted: bool,
-    /// The snowflake of the last message this account read here, or 0.
-    #[serde(default)]
-    pub last_read: u64,
     /// What a thread has besides; none for a channel.
     #[serde(default)]
     pub thread: Option<Box<Thread>>,
@@ -277,6 +252,9 @@ pub struct Channel {
     /// `rate_limit_per_user` says; 0 without slowmode.
     #[serde(default)]
     pub slowmode: u32,
+    /// A stage channel, among the voice channels, where no join sound plays.
+    #[serde(default)]
+    pub stage: bool,
 }
 
 /// What a thread has that a channel doesn't; see
@@ -312,10 +290,6 @@ pub struct Thread {
     /// its `archive_timestamp`; 0 when Discord didn't say.
     #[serde(default)]
     pub archive_changed: u64,
-    /// Quiet for its [`Thread::archive_after`] as the last snapshot saw it,
-    /// though Discord may not have archived it yet; see [`Thread::quiet_at`].
-    #[serde(default)]
-    pub quiet: bool,
     /// How many are in it, as Discord counts them: up to 50.
     #[serde(default)]
     pub members: u32,
@@ -328,10 +302,6 @@ pub struct Thread {
     pub tags: Vec<String>,
     #[serde(default)]
     pub pinned: bool,
-    /// This account has a read state of its own here: it opened or joined
-    /// it. A forum post it never opened shows as new, rather than unread.
-    #[serde(skip)]
-    pub opened: bool,
     /// Its newest message, as a list of threads shows it, while Yapfast knows
     /// it: Discord sends it with a server's active threads, and Yapfast follows
     /// the messages that come after.
@@ -517,7 +487,7 @@ impl Deletes {
 pub const PRIVATE: &str = "@me";
 
 /// A DM or group DM.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Private {
     pub id: String,
     pub group: bool,
@@ -532,11 +502,6 @@ pub struct Private {
     pub request: bool,
     /// A request Discord thinks is spam.
     pub spam: bool,
-    /// The rest are set when the service publishes it, as for [`Channel`].
-    pub unread: bool,
-    pub mentions: u64,
-    pub muted: bool,
-    pub last_read: u64,
 }
 
 /// A DM or group DM, or a message request, from a channel object.
@@ -578,7 +543,6 @@ pub fn private_channel(channel: &Value) -> Option<Private> {
         request: spam || channel["is_message_request"] == true,
         spam,
         id,
-        ..Default::default()
     })
 }
 
@@ -687,13 +651,6 @@ impl Server {
                 == 0
     }
 
-    /// Whether the channel list lists only the channels this account
-    /// follows, as Discord's client lists them: Show All Channels turned
-    /// off, which it heeds only in a Community server.
-    pub fn follows_only(&self) -> bool {
-        self.community && self.notifications.follows_only()
-    }
-
     /// Whether `user`, holding `roles`, may forward `channel`'s messages, as
     /// Discord's client allows: the server lets its messages be forwarded,
     /// and they may read the channel's history. Without the server's roles,
@@ -736,9 +693,20 @@ impl Server {
             return;
         }
         self.forget(id);
+        self.add_channel(channel);
+        self.sort_channels();
+    }
+
+    /// Adds a channel or category from a channel object, where the lists
+    /// end: one not known yet, for [`Self::sort_channels`] to place.
+    fn add_channel(&mut self, channel: &Value) {
+        let Some(id) = channel["id"].as_str() else {
+            return;
+        };
         match channel["type"].as_u64() {
-            // A forum lists among the text channels, as in Discord's client.
-            Some(GUILD_TEXT | GUILD_ANNOUNCEMENT | GUILD_FORUM) => {
+            // A forum or media channel lists among the text channels, as in
+            // Discord's client.
+            Some(GUILD_TEXT | GUILD_ANNOUNCEMENT | GUILD_FORUM | GUILD_MEDIA) => {
                 if let Some(channel) = parse_channel(channel) {
                     self.text_channels.push(channel);
                 }
@@ -760,7 +728,6 @@ impl Server {
             }
             _ => {}
         }
-        self.sort_channels();
     }
 
     /// Puts channels and categories where `placements` say, as the
@@ -809,7 +776,10 @@ impl Server {
     fn forget(&mut self, id: &str) {
         self.text_channels.retain(|channel| channel.id != id);
         self.voice_channels.retain(|channel| channel.id != id);
-        Arc::make_mut(&mut self.categories).remove(id);
+        // Only a category's: a snapshot may share them, and they'd be copied.
+        if self.categories.contains_key(id) {
+            Arc::make_mut(&mut self.categories).remove(id);
+        }
     }
 
     /// Adds or replaces a thread from a channel object. One without
@@ -904,19 +874,29 @@ impl Server {
 
     /// Discord's order: by category, then by position.
     fn sort_channels(&mut self) {
-        let mut text = std::mem::take(&mut self.text_channels);
-        let mut voice = std::mem::take(&mut self.voice_channels);
-        let key = |channel: &Channel| {
-            (
-                self.category_order(channel),
-                channel.position,
-                channel.id.clone(),
-            )
-        };
-        text.sort_by_cached_key(key);
-        voice.sort_by_cached_key(key);
-        self.text_channels = text;
-        self.voice_channels = voice;
+        let text = self.order(&self.text_channels);
+        let voice = self.order(&self.voice_channels);
+        permute(&mut self.text_channels, text);
+        permute(&mut self.voice_channels, voice);
+    }
+
+    /// Where each of `channels` was, in Discord's order: the keys borrow
+    /// their ids, as [`Self::category_order`]'s copies would cost a large
+    /// server two allocations a channel on each sort.
+    fn order(&self, channels: &[Channel]) -> Vec<usize> {
+        let mut keys: Vec<_> = channels
+            .iter()
+            .enumerate()
+            .map(|(at, channel)| {
+                // Channels outside categories first, as category_order has it.
+                let category = self
+                    .category(channel)
+                    .map(|category| (category.position, channel.parent.as_deref()));
+                (category, channel.position, channel.id.as_str(), at)
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.into_iter().map(|(.., at)| at).collect()
     }
 
     /// A text or voice channel's name, or a thread's.
@@ -1266,22 +1246,49 @@ pub fn server(guild: &Value) -> Option<Server> {
         server.put_role(role);
     }
     let channels = guild["channels"].as_array().into_iter().flatten();
-    // Categories first, so the channels in them sort by their position.
-    let (categories, channels): (Vec<_>, Vec<_>) =
-        channels.partition(|channel| channel["type"].as_u64() == Some(GUILD_CATEGORY));
-    for channel in categories.into_iter().chain(channels) {
-        server.put_channel(channel);
-    }
-    // A user account hears only of the active threads it joined.
-    for thread in guild["threads"].as_array().into_iter().flatten() {
-        server.put_thread(thread);
-        if let Some(id) = thread["id"].as_str()
-            && let Some(thread) = server.thread_mut(id)
-        {
-            thread.joined = true;
+    // Sorted once all are in: one sort a channel, each copying every key,
+    // took 10.7 ms for a server of 500 channels.
+    for channel in channels {
+        if is_thread(channel) {
+            server.put_thread(channel);
+        } else {
+            server.add_channel(channel);
         }
     }
+    server.sort_channels();
+    // A user account hears only of the active threads it joined. The newest
+    // first, as put_thread keeps them.
+    let mut threads: Vec<Channel> = guild["threads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(parse_thread)
+        .collect();
+    for details in threads
+        .iter_mut()
+        .filter_map(|thread| thread.thread.as_deref_mut())
+    {
+        details.joined = true;
+    }
+    threads.append(&mut server.threads);
+    threads.sort_by_cached_key(|thread| std::cmp::Reverse(thread.id.parse::<u64>().unwrap_or(0)));
+    threads.dedup_by(|later, earlier| later.id == earlier.id);
+    server.threads = threads;
     Some(server)
+}
+
+/// Reorders `list` to hold what was at each of `order` in turn, as
+/// `sort_by_cached_key` applies its sorted indices.
+fn permute<T>(list: &mut [T], mut order: Vec<usize>) {
+    for at in 0..list.len() {
+        let mut from = order[at];
+        // What was there has moved on already, to where `from` was.
+        while from < at {
+            from = order[from];
+        }
+        order[at] = from;
+        list.swap(at, from);
+    }
 }
 
 /// Whether a channel object is a thread.
@@ -1361,6 +1368,7 @@ fn parse_channel(channel: &Value) -> Option<Channel> {
             .map(Arc::from),
         overwrites: Arc::new(overwrites(channel)),
         announcement: channel["type"].as_u64() == Some(GUILD_ANNOUNCEMENT),
+        stage: channel["type"].as_u64() == Some(GUILD_STAGE_VOICE),
         archive_after: channel["default_auto_archive_duration"]
             .as_u64()
             .and_then(|minutes| u16::try_from(minutes).ok())

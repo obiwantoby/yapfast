@@ -72,7 +72,15 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
                     .iter()
                     .map(|message| message.item.clone())
                     .collect();
-                adapter.action(&window, Action::VisibleMessages { room, items });
+                let at_end = window.invoke_timeline_at_end();
+                adapter.action(
+                    &window,
+                    Action::VisibleMessages {
+                        room,
+                        items,
+                        at_end,
+                    },
+                );
             },
         );
     });
@@ -113,7 +121,14 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
                     .map(|message| message.item.clone())
                     .collect();
                 let room = aside.room.clone();
-                adapter.action(&window, Action::VisibleMessages { room, items });
+                adapter.action(
+                    &window,
+                    Action::VisibleMessages {
+                        room,
+                        items,
+                        at_end: false,
+                    },
+                );
             },
         );
     });
@@ -208,6 +223,19 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     });
     let state = adapter.clone();
     let weak = window.as_weak();
+    window.on_unblock(move |user| {
+        if let Some(window) = weak.upgrade() {
+            state.borrow_mut().action(
+                &window,
+                Action::ChangeRelationship {
+                    user: user.to_string(),
+                    change: yapfast_core::chat::RelationshipChange::Unblock,
+                },
+            );
+        }
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
     window.on_remove_friend_request(move |user| {
         if let Some(window) = weak.upgrade() {
             state
@@ -274,6 +302,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         });
     }
     bind!(on_close_forward, Action::CloseForward);
+    bind!(on_close_switcher, Action::CloseSwitcher);
     bind!(on_dismiss_notice, Action::DismissNotice);
     bind!(on_close_image, Action::CloseImage);
     {
@@ -407,6 +436,8 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     bind_item!(on_start_forward, Action::StartForward);
     bind_item!(on_forward_choose, Action::ChooseForward);
     bind_item!(on_forward_send, Action::Forward);
+    bind_item!(on_switcher_search, Action::SearchSwitcher);
+    bind_item!(on_switch_to, Action::SwitchTo);
     bind!(on_open_new_dm, Action::OpenNewDm);
     bind!(on_open_add_friend, Action::OpenAddFriend);
     bind!(on_open_requests, Action::OpenDmScreen(DmScreen::Requests));
@@ -520,8 +551,9 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             });
         });
     }
-    bind!(on_leave_server, Action::LeaveServer);
-    bind!(on_close_leave, Action::CloseLeaveServer);
+    bind!(on_confirm_leave, Action::Leave);
+    bind!(on_toggle_silent_leave, Action::ToggleSilentLeave);
+    bind!(on_close_leave, Action::CloseLeave);
     {
         let adapter = adapter.clone();
         let weak = window.as_weak();
@@ -1079,6 +1111,12 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         }
     });
     let weak = window.as_weak();
+    window.on_call_volumes_changed(move || {
+        if let Some(window) = weak.upgrade() {
+            play_call_volumes(&window);
+        }
+    });
+    let weak = window.as_weak();
     window.on_record_talk_key(move |on| {
         if let Some(window) = weak.upgrade() {
             window.set_talk_recording(on);
@@ -1115,6 +1153,9 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         yapfast_core::push_to_talk::set_on(layout.input_mode == InputMode::PushToTalk);
         layout.push_to_talk_release_delay = Some(window.get_talk_delay().max(0) as u32);
         yapfast_core::push_to_talk::set_release_delay(layout.release_delay());
+        layout.microphone_volume = Some(window.get_microphone_volume().clamp(0, 200) as u8);
+        layout.speaker_volume = Some(window.get_speaker_volume().clamp(0, 200) as u8);
+        play_call_volumes(&window);
         layout.share_typing = Some(window.get_share_typing());
         layout.notifications = Some(window.get_notifications());
         layout.notification_text = Some(window.get_notification_text());
@@ -1123,6 +1164,9 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
         layout.sound_volume = Some(window.get_sound_volume().clamp(0, 200) as u8);
         layout.adjust_each_sound = window.get_adjust_each_sound();
         layout.gpu_rendering = window.get_gpu_rendering();
+        layout.gpu_encoding = Some(window.get_gpu_encoding());
+        #[cfg(feature = "discord")]
+        yapfast_core::stream_worker::set_hardware_encoding(window.get_gpu_encoding());
         layout.close_to_tray = Some(window.get_close_to_tray());
         layout.multiple_windows = window.get_multiple_windows();
         adapter.layout.write(&adapter.root);
@@ -1903,7 +1947,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
     });
     let state = adapter.clone();
     let weak = window.as_weak();
-    window.on_go_live(move |source, resolution, fps| {
+    window.on_go_live(move |source, resolution, fps, high_quality| {
         if let Some(window) = weak.upgrade() {
             #[cfg(feature = "discord")]
             {
@@ -1923,6 +1967,7 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
             let quality = voice::StreamQuality {
                 resolution,
                 fps: fps.clamp(1, 60) as u32,
+                high_quality,
             };
             state
                 .borrow_mut()
@@ -2231,6 +2276,92 @@ pub(super) fn bind_callbacks(window: &YapfastWindow, adapter: &Rc<RefCell<Adapte
                     .borrow_mut()
                     .action(&window, Action::Voice(voice::Command::Speaker(id)));
             }
+        }
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_play_soundboard(move |id| {
+        let Some(window) = weak.upgrade() else { return };
+        state.borrow_mut().action(
+            &window,
+            Action::Voice(voice::Command::Soundboard(id.into())),
+        );
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_preview_soundboard(move |id| {
+        let Some(window) = weak.upgrade() else { return };
+        state.borrow_mut().action(
+            &window,
+            Action::Voice(voice::Command::PreviewSound(id.into())),
+        );
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_favorite_soundboard(move |id, favorite| {
+        let Some(window) = weak.upgrade() else { return };
+        state.borrow_mut().action(
+            &window,
+            Action::Voice(voice::Command::FavoriteSound(id.into(), favorite)),
+        );
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_soundboard_volume_committed(move |volume| {
+        let Some(window) = weak.upgrade() else { return };
+        state
+            .borrow_mut()
+            .action(&window, Action::SoundboardVolume(volume as f32));
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_entrance_sounds_wanted(move || {
+        let Some(window) = weak.upgrade() else { return };
+        state.borrow_mut().action(&window, Action::LoadSoundCatalog);
+    });
+    // Another server's entrance sound shows.
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_entrance_server_chosen(move |_| {
+        let Some(window) = weak.upgrade() else { return };
+        state.borrow_mut().refresh(&window);
+    });
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_choose_entrance_sound(move |id| {
+        let Some(window) = weak.upgrade() else { return };
+        let server = {
+            let adapter = state.borrow();
+            usize::try_from(window.get_entrance_server())
+                .ok()
+                .and_then(|index| adapter.entrance_servers.get(index).cloned())
+                .flatten()
+        };
+        let sound = (!id.is_empty()).then(|| id.to_string());
+        state
+            .borrow_mut()
+            .action(&window, Action::SetJoinSound { server, sound });
+    });
+    // The sounds' custom emoji come once the soundboard shows.
+    let state = adapter.clone();
+    let weak = window.as_weak();
+    window.on_soundboard_opened(move || {
+        let Some(window) = weak.upgrade() else { return };
+        let pictures: Vec<String> = state
+            .borrow()
+            .app
+            .state
+            .voice
+            .soundboard
+            .iter()
+            .flat_map(|groups| groups.iter())
+            .flat_map(|group| &group.sounds)
+            .filter_map(|sound| sound.picture.clone())
+            .collect();
+        if !pictures.is_empty() {
+            state
+                .borrow_mut()
+                .action(&window, Action::LoadPictures(pictures));
         }
     });
     let state = adapter.clone();

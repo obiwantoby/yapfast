@@ -31,6 +31,8 @@ pub enum MenuChoice {
     EditNickname,
     /// Close a one-to-one Discord DM.
     CloseDm,
+    /// Leave a Discord group DM, asking first.
+    LeaveGroup,
     /// Send someone an invite to one of this account's Discord servers, in
     /// a submenu of them; see `places.rs`.
     InviteToServer,
@@ -62,6 +64,9 @@ pub enum MenuChoice {
     // A member's in a voice channel, as its menu there offers them.
     /// Mute someone for this account alone, as a box to tick.
     LocalMute,
+    /// Mute the soundboard sounds someone plays, for this account alone,
+    /// as a box to tick.
+    SoundboardMute,
     /// This account's own mute and deafen in the call it's in here.
     SelfMute,
     SelfDeafen,
@@ -235,6 +240,7 @@ impl AppState {
     pub(super) fn dm_with(&self, user: &str) -> Option<&ChatRoom> {
         self.rooms
             .iter()
+            .map(Arc::as_ref)
             .find(|room| room.direct && room.person.as_deref() == Some(user))
     }
 
@@ -292,6 +298,11 @@ impl AppState {
                 MenuChoice::Mute
             });
         }
+        // After muting, as in Discord's menu; Discord takes it only while
+        // connected.
+        if discord && room.person.is_none() && !room.request && self.discord_online {
+            choices.push(MenuChoice::LeaveGroup);
+        }
         // A thread's notifications are its own, which Yapfast doesn't change yet.
         if room.network == Network::Discord
             && !room.direct
@@ -311,10 +322,11 @@ impl AppState {
     /// account stands with someone: friendship, ignoring and blocking.
     pub(super) fn relationship_choices(&self, person: &str) -> Vec<MenuChoice> {
         let has = |list: &[String]| list.iter().any(|listed| listed == person);
+        let blocked = self.is_blocked(person);
         let friendship = match self.relation(person) {
             Relation::Friend => Some(MenuChoice::Unfriend),
             // Discord takes no request to someone blocked.
-            Relation::Stranger if !has(&self.discord_blocked) => Some(MenuChoice::AddFriend),
+            Relation::Stranger if !blocked => Some(MenuChoice::AddFriend),
             Relation::Incoming => Some(MenuChoice::AcceptFriend),
             Relation::Outgoing => Some(MenuChoice::CancelFriendRequest),
             Relation::Stranger | Relation::Me => None,
@@ -324,7 +336,7 @@ impl AppState {
         } else {
             MenuChoice::Ignore
         };
-        let block = if has(&self.discord_blocked) {
+        let block = if blocked {
             MenuChoice::Unblock
         } else {
             MenuChoice::Block
@@ -354,6 +366,7 @@ impl AppState {
     fn folder_servers(&self, id: &str) -> impl Iterator<Item = &ChatServer> {
         self.servers
             .iter()
+            .map(Arc::as_ref)
             .filter(move |server| server.folder.as_ref().is_some_and(|folder| folder.id == id))
     }
 
@@ -383,6 +396,7 @@ impl AppState {
             .unwrap_or_default();
         self.rooms
             .iter()
+            .map(Arc::as_ref)
             .filter(move |room| channels.contains(&room.id) && unread(room))
     }
 }
@@ -451,6 +465,32 @@ impl Application {
             .unwrap_or_default();
         effects.extend(self.select_showing(id, chat));
         effects
+    }
+
+    /// Opens the quick switcher with nothing searched for, unless a dialog
+    /// has the keyboard, or closes it.
+    pub(super) fn toggle_switcher(&mut self) -> Vec<Effect> {
+        if self.state.switcher.take().is_some() || self.state.dialog_open() {
+            return vec![];
+        }
+        self.state.switcher = Some(String::new());
+        // It ranks places by how much they're used, which Discord's
+        // settings count.
+        if self.state.discord_linked {
+            return self.ask_places_used();
+        }
+        vec![]
+    }
+
+    /// Goes where the quick switcher found: to a server's channel shown
+    /// last, or to a conversation.
+    pub(super) fn switch_to(&mut self, id: String) -> Vec<Effect> {
+        self.state.switcher = None;
+        if self.state.servers.iter().any(|server| server.id == id) {
+            self.navigate(Navigation::Server(id))
+        } else {
+            self.open(id, false)
+        }
     }
 
     /// Switches the selected voice channel between its chat and its call.
@@ -630,6 +670,34 @@ impl Application {
         vec![Effect::Backend(Command::Discord(DiscordCommand::CloseDm {
             room,
         }))]
+    }
+
+    /// Asks before leaving a Discord group DM, from its menu, as Discord's
+    /// client does.
+    pub(super) fn ask_leave_group(&mut self, room: String) -> Vec<Effect> {
+        if !self
+            .state
+            .menu_choices(&room)
+            .contains(&MenuChoice::LeaveGroup)
+        {
+            return vec![];
+        }
+        let name = self
+            .state
+            .rooms
+            .iter()
+            .find(|known| known.id == room)
+            .map(|known| known.name.clone())
+            .unwrap_or_default();
+        self.state.leave = Some(LeaveDialog {
+            place: room,
+            name,
+            group: true,
+            silent: false,
+            leaving: false,
+            error: None,
+        });
+        vec![]
     }
 
     pub(super) fn mute_dm(&mut self, room: String, muting: Muting) -> Vec<Effect> {
@@ -824,6 +892,7 @@ impl Application {
             .state
             .rooms
             .iter()
+            .map(Arc::as_ref)
             .find(|room| Some(&room.id) == remembered && self.state.in_scope(room))
             // A message request opens only when chosen.
             .or_else(|| self.state.scoped_rooms().find(|room| !room.request))
@@ -886,14 +955,17 @@ impl Application {
             (self.discord_index.rooms(), self.discord_index.servers());
         #[cfg(not(feature = "discord"))]
         let (discord_rooms, discord_servers) = (std::iter::empty(), std::iter::empty());
-        chat::sync_list(
+        let rooms = chat::sync_list(
             &mut self.state.rooms,
             self.matrix_rooms.iter().chain(discord_rooms),
         );
-        chat::sync_list(
+        let servers = chat::sync_list(
             &mut self.state.servers,
             self.matrix_servers.iter().chain(discord_servers),
         );
+        if rooms || servers {
+            self.state.list_changes = self.state.list_changes.wrapping_add(1);
+        }
         if let Navigation::Server(id) = &self.state.navigation
             && !self.state.servers.iter().any(|server| &server.id == id)
         {

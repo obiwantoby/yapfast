@@ -331,7 +331,7 @@ pub(crate) fn load(token: &str, key: Option<Key>) -> Loaded {
     let mut snapshot = Arc::unwrap_or_clone(saved.snapshot);
     snapshot.status = Status::Connecting;
     for conversation in &mut snapshot.conversations {
-        conversation.call = false;
+        Arc::make_mut(conversation).call = false;
     }
     Loaded {
         snapshot,
@@ -821,7 +821,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        ready::Server,
+        marked::{ChannelMarks, MarkedServer, ServerMarks},
+        ready::{Channel, Server},
         service::{Account, Conversation},
     };
 
@@ -848,16 +849,31 @@ mod tests {
                 mfa_enabled: false,
                 has_email: true,
             }),
-            servers: vec![Arc::new(Server {
-                id: "10".into(),
-                name: "Server".into(),
-                ..Default::default()
-            })],
-            conversations: vec![Conversation {
+            servers: vec![MarkedServer::marked(
+                Server {
+                    id: "10".into(),
+                    name: "Server".into(),
+                    text_channels: vec![Channel {
+                        id: "11".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ServerMarks {
+                    muted: true,
+                    ..Default::default()
+                },
+                |_| ChannelMarks {
+                    unread: true,
+                    mentions: 2,
+                    ..Default::default()
+                },
+            )],
+            conversations: vec![Arc::new(Conversation {
                 id: "20".into(),
                 call: true,
                 ..Default::default()
-            }],
+            })],
             ..Default::default()
         };
         let mut names = Names::default();
@@ -870,6 +886,8 @@ mod tests {
         assert_eq!(shown.snapshot.status, Status::Connecting);
         assert_eq!(shown.snapshot.account.unwrap().name, "Alice");
         assert_eq!(shown.snapshot.servers[0].name, "Server");
+        // With what's this account's there, in the server's own object.
+        assert_eq!(shown.snapshot.servers, snapshot.servers);
         assert!(
             !shown.snapshot.conversations[0].call,
             "calls are over by now"

@@ -5,8 +5,15 @@ fn discord_event(snapshot: yapfast_discord::service::Snapshot) -> Event {
     Event::Discord(Arc::new(snapshot))
 }
 use crate::{chat::RoomIndex, sounds::Sound};
+#[cfg(feature = "discord")]
+use yapfast_discord::marked::{ChannelMarks, MarkedServer, ServerMarks};
 
 /// The sounds among effects, in order.
+/// Copies of the rooms or servers a list shares, as a network sends them.
+fn owned<T: Clone>(list: &[Arc<T>]) -> Vec<T> {
+    list.iter().map(|item| (**item).clone()).collect()
+}
+
 fn sounds(effects: &[Effect]) -> Vec<Sound> {
     effects
         .iter()
@@ -77,8 +84,8 @@ fn the_requests_screen_stands_in_for_a_conversation() {
     assert_eq!(app.state.dm_screen, Some(DmScreen::Requests));
     assert_eq!(app.state.selected, None);
     // The lists changing doesn't pick a conversation over it.
-    let rooms = app.state.rooms.clone();
-    let servers = app.state.servers.clone();
+    let rooms = owned(&app.state.rooms);
+    let servers = owned(&app.state.servers);
     app.apply(Event::Rooms(RoomIndex { rooms, servers }));
     assert_eq!(app.state.dm_screen, Some(DmScreen::Requests));
     assert_eq!(app.state.selected, None);
@@ -386,18 +393,18 @@ fn forwarding_sends_a_message_to_the_conversations_chosen() {
     app.dispatch(Action::StartForward("e:$bob".into()));
     assert_eq!(app.state.forwarding.as_ref().unwrap().quote, "Hello there");
     // Up to five, within the message's network, and nothing goes until Send.
-    let general = app.state.rooms[1].clone();
+    let general = (*app.state.rooms[1]).clone();
     for id in ["c1", "c2", "c3", "c4", "c5"] {
-        app.state.rooms.push(ChatRoom {
+        app.state.rooms.push(Arc::new(ChatRoom {
             id: id.into(),
             ..general.clone()
-        });
+        }));
     }
-    app.state.rooms.push(ChatRoom {
+    app.state.rooms.push(Arc::new(ChatRoom {
         id: crate::discord::room_id("10", "11"),
         network: Network::Discord,
         ..general.clone()
-    });
+    }));
     assert!(
         !app.state
             .can_forward_to("dm", app.state.rooms.last().unwrap())
@@ -478,11 +485,13 @@ fn discord_forwards_skip_the_note_in_slowmode_and_take_silent() {
         slowed,
         ..preview_room("x", id, false, 3)
     };
-    app.state.rooms = vec![
+    app.state.rooms = [
         channel("11", false),
         channel("12", true),
         channel("13", false),
-    ];
+    ]
+    .map(Arc::new)
+    .into();
     app.state.discord_online = true;
     app.state.selected = Some(app.state.rooms[0].id.clone());
     let mut sent = message("d:5", false);
@@ -517,7 +526,7 @@ fn discord_forwards_list_places_as_discords_dialog_does() {
         direct: guild == "@me",
         ..preview_room("x", id, false, 3)
     };
-    app.state.rooms = vec![
+    app.state.rooms = [
         ChatRoom {
             person: Some("1".into()),
             ..place("@me", "20", "Bob")
@@ -527,7 +536,9 @@ fn discord_forwards_list_places_as_discords_dialog_does() {
         place("10", "12", "games"),
         place("10", "13", "game-night"),
         place("10", "14", "chat"),
-    ];
+    ]
+    .map(Arc::new)
+    .into();
     let id = |channel| crate::discord::room_id("10", channel);
     let (games, chat) = (id("12"), id("14"));
     app.state.discord_online = true;
@@ -585,6 +596,112 @@ fn discord_forwards_list_places_as_discords_dialog_does() {
 }
 
 #[test]
+fn the_quick_switcher_finds_places_as_discords_does() {
+    // Matrix rooms, with a Space as the server.
+    let mut app = connected();
+    app.state.rooms.extend(
+        [
+            ChatRoom {
+                locked: true,
+                ..preview_room("staff", "staff", false, 3)
+            },
+            ChatRoom {
+                category: crate::discord::REQUESTS.into(),
+                request: true,
+                ..preview_room("request", "Ronja", true, 2)
+            },
+        ]
+        .map(Arc::new),
+    );
+    app.dispatch(Action::Open("dm".into()));
+    app.dispatch(Action::Open("games".into()));
+    app.dispatch(Action::Open("general".into()));
+    let listed = |app: &Application| -> Vec<String> {
+        app.state
+            .switcher_places()
+            .iter()
+            .map(|place| place.name().to_owned())
+            .collect()
+    };
+    assert!(listed(&app).is_empty(), "closed");
+    app.dispatch(Action::ToggleSwitcher);
+    // Those opened lately, but not the one open.
+    assert_eq!(listed(&app), ["games", "DM"]);
+    // A search finds servers too, those as good by name, but not what this
+    // account can't read, nor message requests.
+    app.dispatch(Action::SearchSwitcher("s".into()));
+    assert_eq!(listed(&app), ["Friends", "games"]);
+    app.dispatch(Action::SearchSwitcher("g".into()));
+    assert_eq!(listed(&app), ["games", "general", "Lounge"]);
+    app.dispatch(Action::SearchSwitcher("ronja".into()));
+    assert!(listed(&app).is_empty());
+    app.dispatch(Action::SearchSwitcher("#g".into()));
+    assert_eq!(listed(&app), ["games", "general"]);
+    app.dispatch(Action::SearchSwitcher("!".into()));
+    assert_eq!(listed(&app), ["Lounge", "Party"]);
+    app.dispatch(Action::SearchSwitcher("*f".into()));
+    assert_eq!(listed(&app), ["Friends"]);
+    // Going to a place closes it; a server shows its channel shown last.
+    app.dispatch(Action::SwitchTo("dm".into()));
+    assert!(app.state.switcher.is_none());
+    assert_eq!(app.state.navigation, Navigation::DirectMessages);
+    assert_eq!(app.state.selected.as_deref(), Some("dm"));
+    app.dispatch(Action::ToggleSwitcher);
+    app.dispatch(Action::SwitchTo("friends".into()));
+    assert_eq!(app.state.navigation, Navigation::Server("friends".into()));
+    assert_eq!(app.state.selected.as_deref(), Some("general"));
+    app.dispatch(Action::ToggleSwitcher);
+    app.dispatch(Action::ToggleSwitcher);
+    assert!(app.state.switcher.is_none());
+    // A dialog keeps the keyboard.
+    app.dispatch(Action::OpenNewDm);
+    assert!(app.state.new_dm.is_some());
+    app.dispatch(Action::ToggleSwitcher);
+    assert!(app.state.switcher.is_none());
+}
+
+#[test]
+fn discord_forwards_list_eight_places_opened_lately_that_can_take_them() {
+    let mut app = connected();
+    let channel = |id: u32| ChatRoom {
+        id: crate::discord::room_id("10", &id.to_string()),
+        name: format!("c{id}"),
+        network: Network::Discord,
+        capabilities: Network::Discord.capabilities(),
+        ..preview_room("x", "x", false, 3)
+    };
+    app.state.rooms = (11..=20).map(channel).map(Arc::new).collect();
+    app.state.discord_online = true;
+    // Matrix rooms opened in between take room among those kept, but not
+    // among those listed.
+    for id in 11..=20 {
+        let room = crate::discord::room_id("10", &id.to_string());
+        app.state.places_used.visit(&room, crate::clock::now_ms());
+        app.state
+            .places_used
+            .visit(&format!("!m{id}:test"), crate::clock::now_ms());
+    }
+    app.state.selected = Some(crate::discord::room_id("10", "20"));
+    let mut sent = message("d:5", false);
+    sent.can_forward = true;
+    app.state.messages = Arc::new(timeline(vec![sent]));
+    app.dispatch(Action::StartForward("d:5".into()));
+    let listed: Vec<String> = app
+        .state
+        .forward_places()
+        .iter()
+        .map(|room| room.name.clone())
+        .collect();
+    // Those opened lately but the message's own, then the others used.
+    assert_eq!(
+        listed,
+        [
+            "c19", "c18", "c17", "c16", "c15", "c14", "c13", "c11", "c12"
+        ]
+    );
+}
+
+#[test]
 fn room_membership_loss_moves_selection_and_server_loss_returns_to_dms() {
     let mut app = connected();
     app.dispatch(Action::Navigate(Navigation::Server("friends".into())));
@@ -595,12 +712,12 @@ fn room_membership_loss_moves_selection_and_server_loss_returns_to_dms() {
         .rooms
         .iter()
         .filter(|room| room.id != "games")
-        .cloned()
+        .map(|room| (**room).clone())
         .collect();
-    let servers = app.state.servers.clone();
+    let servers = owned(&app.state.servers);
     app.apply(Event::Rooms(RoomIndex { rooms, servers }));
     assert_eq!(app.state.selected.as_deref(), Some("general"));
-    let rooms = app.state.rooms.clone();
+    let rooms = owned(&app.state.rooms);
     app.apply(Event::Rooms(RoomIndex {
         rooms,
         servers: vec![],
@@ -934,6 +1051,7 @@ fn files_wait_in_the_composer_until_sent() {
         .state
         .rooms
         .iter_mut()
+        .map(Arc::make_mut)
         .find(|room| room.id == "dm")
         .unwrap();
     room.capabilities = Network::Discord.capabilities();
@@ -1012,6 +1130,7 @@ fn uploads_name_their_destination_as_discord_does() {
         app.state
             .rooms
             .iter_mut()
+            .map(Arc::make_mut)
             .find(|room| room.id == id)
             .unwrap()
     }
@@ -1366,6 +1485,7 @@ fn security_gates_are_shared_by_every_ui_adapter() {
     app.state
         .rooms
         .iter_mut()
+        .map(Arc::make_mut)
         .find(|room| room.id == "dm")
         .unwrap()
         .encrypted = false;
@@ -1373,6 +1493,7 @@ fn security_gates_are_shared_by_every_ui_adapter() {
     app.state
         .rooms
         .iter_mut()
+        .map(Arc::make_mut)
         .find(|room| room.id == "lounge")
         .unwrap()
         .encrypted = false;
@@ -1437,6 +1558,7 @@ fn bob_live_in_lounge() -> Application {
         .state
         .rooms
         .iter_mut()
+        .map(Arc::make_mut)
         .find(|room| room.id == "lounge")
         .unwrap();
     lounge.people = vec![chat::VoicePerson {
@@ -1565,6 +1687,7 @@ fn clicking_someone_with_only_a_camera_shows_the_channel_without_joining() {
         .state
         .rooms
         .iter_mut()
+        .map(Arc::make_mut)
         .find(|room| room.id == "lounge")
         .unwrap();
     lounge.people = vec![chat::VoicePerson {
@@ -1618,8 +1741,10 @@ fn a_discord_voice_channels_chat_opens_without_joining_it() {
     room.voice = true;
     room.join_locked = true;
     app.state.discord_online = true;
-    app.state.rooms.push(room);
-    app.state.servers[0].channels.push(id.into());
+    app.state.rooms.push(Arc::new(room));
+    Arc::make_mut(&mut app.state.servers[0])
+        .channels
+        .push(id.into());
     let opens = |effects: &[Effect]| {
         effects.iter().any(|effect| {
             matches!(
@@ -1675,6 +1800,7 @@ fn a_discord_voice_channels_chat_opens_without_joining_it() {
     app.state
         .rooms
         .iter_mut()
+        .map(Arc::make_mut)
         .find(|room| room.id == id)
         .unwrap()
         .read_only = true;
@@ -1689,9 +1815,9 @@ fn a_folder_marks_its_servers_read() {
         name: None,
         color: None,
     };
-    let mut rooms = app.state.rooms.clone();
+    let mut rooms = owned(&app.state.rooms);
     rooms.push(preview_room("standup", "standup", false, 3));
-    let mut servers = app.state.servers.clone();
+    let mut servers = owned(&app.state.servers);
     servers[0].folder = Some(folder.clone());
     servers.push(ChatServer {
         id: "work".into(),
@@ -1732,7 +1858,7 @@ fn a_folder_marks_its_servers_read() {
 fn menus_offer_what_fits_their_conversation_or_server() {
     use MenuChoice::*;
     let mut app = connected();
-    let mut rooms = app.state.rooms.clone();
+    let mut rooms = owned(&app.state.rooms);
     rooms
         .iter_mut()
         .find(|room| room.id == "general")
@@ -1743,7 +1869,7 @@ fn menus_offer_what_fits_their_conversation_or_server() {
         .find(|room| room.id == "games")
         .unwrap()
         .mentions = 1;
-    let servers = app.state.servers.clone();
+    let servers = owned(&app.state.servers);
     app.apply(Event::Rooms(RoomIndex { rooms, servers }));
     assert_eq!(
         app.state.menu_choices("dm"),
@@ -1800,11 +1926,15 @@ fn menus_offer_what_fits_their_conversation_or_server() {
 fn a_discord_dms_menu_manages_its_person_and_notifications() {
     use MenuChoice::*;
     use chat::{Muting, RelationshipChange};
-    use yapfast_discord::service::{Conversation, Friend, Snapshot, Status};
+    use yapfast_discord::service::{BlockedUser, Conversation, Friend, Snapshot, Status};
     let snapshot = |friends: bool, muted: bool, blocked: bool, ignored: bool| Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        friends: if friends { vec!["2".into()] } else { vec![] },
+        friends: if friends {
+            vec!["2".into()].into()
+        } else {
+            vec![].into()
+        },
         friend_list: if friends {
             vec![Friend {
                 user_id: "2".into(),
@@ -1815,27 +1945,47 @@ fn a_discord_dms_menu_manages_its_person_and_notifications() {
                 activity: None,
                 activities: Default::default(),
             }]
+            .into()
         } else {
-            vec![]
+            vec![].into()
         },
-        blocked: if blocked { vec!["2".into()] } else { vec![] },
-        ignored: if ignored { vec!["2".into()] } else { vec![] },
+        blocked: if blocked {
+            vec!["2".into()].into()
+        } else {
+            vec![].into()
+        },
+        blocked_list: if blocked {
+            vec![BlockedUser {
+                user_id: "2".into(),
+                name: "Annie".into(),
+                username: None,
+                avatar: String::new(),
+            }]
+            .into()
+        } else {
+            vec![].into()
+        },
+        ignored: if ignored {
+            vec!["2".into()].into()
+        } else {
+            vec![].into()
+        },
         conversations: vec![
-            Conversation {
+            Arc::new(Conversation {
                 id: "30".into(),
                 name: "Annie".into(),
                 person: Some("2".into()),
                 people: 2,
                 muted,
                 ..Default::default()
-            },
-            Conversation {
+            }),
+            Arc::new(Conversation {
                 id: "31".into(),
                 name: "Group".into(),
                 group: true,
                 people: 3,
                 ..Default::default()
-            },
+            }),
         ],
         ..Default::default()
     };
@@ -1862,7 +2012,7 @@ fn a_discord_dms_menu_manages_its_person_and_notifications() {
     // A group has no one person to manage.
     assert_eq!(
         app.state.menu_choices("discord:@me:31"),
-        [Pin, Call, Mute, CopyLink, CopyId]
+        [Pin, Call, Mute, LeaveGroup, CopyLink, CopyId]
     );
     app.apply(discord_event(snapshot(false, true, true, true)));
     assert_eq!(
@@ -2453,24 +2603,32 @@ fn discord_channels_join_unless_locked_and_hidden_ones_show_on_request() {
     let mut app = connected();
     app.apply(discord_event(Snapshot {
         status: Status::Online,
-        servers: vec![Arc::new(Server {
-            id: "10".into(),
-            name: "Test".into(),
-            voice_channels: vec![
-                Channel {
-                    id: "11".into(),
-                    name: "Lounge".into(),
-                    ..Default::default()
-                },
-                Channel {
-                    id: "12".into(),
-                    name: "Staff".into(),
+        servers: vec![marked(
+            Server {
+                id: "10".into(),
+                name: "Test".into(),
+                voice_channels: vec![
+                    Channel {
+                        id: "11".into(),
+                        name: "Lounge".into(),
+                        ..Default::default()
+                    },
+                    Channel {
+                        id: "12".into(),
+                        name: "Staff".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            &[(
+                "12",
+                ChannelMarks {
                     access: Access::Hidden,
                     ..Default::default()
                 },
-            ],
-            ..Default::default()
-        })],
+            )],
+        )],
         ..Default::default()
     }));
     assert!(app.state.servers.iter().any(|server| server.discord));
@@ -2708,7 +2866,7 @@ fn asks_once_for_the_pictures_on_screen() {
     };
     let snapshot = |member: &str| Snapshot {
         status: Status::Online,
-        servers: vec![Arc::new(Server {
+        servers: vec![MarkedServer::from(Server {
             id: "10".into(),
             name: "Test".into(),
             icon: Some("icon.png".into()),
@@ -2846,11 +3004,11 @@ fn new_dms_find_people_on_both_networks_and_open_once_listed() {
     app.apply(Event::DmStarted(Ok("!sam".into())));
     assert!(app.state.new_dm.is_none());
     assert_eq!(app.state.selected.as_deref(), Some("dm"));
-    let mut rooms = app.state.rooms.clone();
+    let mut rooms = owned(&app.state.rooms);
     rooms.push(preview_room("!sam", "Sam", true, 2));
     let effects = app.apply(Event::Rooms(RoomIndex {
         rooms,
-        servers: app.state.servers.clone(),
+        servers: owned(&app.state.servers),
     }));
     assert_eq!(app.state.selected.as_deref(), Some("!sam"));
     assert!(
@@ -2986,7 +3144,7 @@ fn discord_mentions_search_the_server_and_name_roles() {
             mfa_enabled: false,
             has_email: true,
         }),
-        servers: vec![Arc::new(Server {
+        servers: vec![MarkedServer::from(Server {
             id: "10".into(),
             name: "Test".into(),
             text_channels: vec![Channel {
@@ -3099,7 +3257,7 @@ fn discord_threads_open_once_listed() {
     };
     let snapshot = |threads: &[&str], joined: &[&str], viewing: Option<&str>| Snapshot {
         status: Status::Online,
-        servers: vec![Arc::new(Server {
+        servers: vec![MarkedServer::from(Server {
             id: "10".into(),
             name: "Test".into(),
             text_channels: vec![Channel {
@@ -3215,7 +3373,7 @@ fn discord_threads_show_beside_their_channel() {
     };
     let snapshot = |threads: &[&str], viewing: &[&str]| Snapshot {
         status: Status::Online,
-        servers: vec![Arc::new(Server {
+        servers: vec![MarkedServer::from(Server {
             id: "10".into(),
             name: "Test".into(),
             text_channels: vec![
@@ -3409,25 +3567,41 @@ fn discord_text_channels_write_without_matrix_trust_and_read_once_read() {
     };
     let snapshot = |unread: bool| Snapshot {
         status: Status::Online,
-        servers: vec![Arc::new(Server {
-            id: "10".into(),
-            name: "Test".into(),
-            text_channels: vec![
-                Channel {
-                    id: "21".into(),
-                    name: "general".into(),
-                    unread,
-                    ..Default::default()
-                },
-                Channel {
-                    id: "22".into(),
-                    name: "news".into(),
-                    access: Access::Locked,
-                    ..Default::default()
-                },
+        servers: vec![marked(
+            Server {
+                id: "10".into(),
+                name: "Test".into(),
+                text_channels: vec![
+                    Channel {
+                        id: "21".into(),
+                        name: "general".into(),
+                        ..Default::default()
+                    },
+                    Channel {
+                        id: "22".into(),
+                        name: "news".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            &[
+                (
+                    "21",
+                    ChannelMarks {
+                        unread,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "22",
+                    ChannelMarks {
+                        access: Access::Locked,
+                        ..Default::default()
+                    },
+                ),
             ],
-            ..Default::default()
-        })],
+        )],
         ..Default::default()
     };
     let mut app = connected();
@@ -3502,7 +3676,7 @@ fn discord_dms_list_with_their_pictures_and_read_once_read() {
     let effects = app.apply(discord_event(Snapshot {
         status: Status::Online,
         conversations: vec![
-            Conversation {
+            Arc::new(Conversation {
                 id: "30".into(),
                 name: "Ann".into(),
                 avatar: Some("ann.png".into()),
@@ -3510,14 +3684,14 @@ fn discord_dms_list_with_their_pictures_and_read_once_read() {
                 unread: true,
                 mentions: 2,
                 ..Default::default()
-            },
-            Conversation {
+            }),
+            Arc::new(Conversation {
                 id: "31".into(),
                 name: "Weekend".into(),
                 group: true,
                 people: 3,
                 ..Default::default()
-            },
+            }),
         ],
         ..Default::default()
     }));
@@ -3626,14 +3800,14 @@ fn discord_profiles_load_the_rest_from_discord() {
     let mut app = Application::default();
     app.apply(discord_event(Snapshot {
         status: Status::Online,
-        conversations: vec![Conversation {
+        conversations: vec![Arc::new(Conversation {
             id: "30".into(),
             name: "Ann".into(),
             avatar: Some("ann.png".into()),
             person: Some("7".into()),
             people: 2,
             ..Default::default()
-        }],
+        })],
         ..Default::default()
     }));
     let effects = app.dispatch(Action::ShowDmProfile("discord:@me:30".into()));
@@ -3697,13 +3871,13 @@ fn discord_profiles_show_the_kept_one_until_discord_answers() {
     let mut app = Application::default();
     app.apply(discord_event(Snapshot {
         status: Status::Online,
-        conversations: vec![Conversation {
+        conversations: vec![Arc::new(Conversation {
             id: "30".into(),
             name: "Ann".into(),
             person: Some("7".into()),
             people: 2,
             ..Default::default()
-        }],
+        })],
         ..Default::default()
     }));
     let ann = |bio: &str| Profile {
@@ -3763,7 +3937,7 @@ fn discord_friends_are_listed_and_messaged() {
     let snapshot = |dms: &[(&str, &str)]| Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        friends: vec!["2".into(), "3".into()],
+        friends: vec!["2".into(), "3".into()].into(),
         friend_list: vec![
             Friend {
                 activity: Some("making tea".into()),
@@ -3771,7 +3945,8 @@ fn discord_friends_are_listed_and_messaged() {
                 ..friend("2", "Ann", Some(Discord::Idle))
             },
             friend("3", "Bob", None),
-        ],
+        ]
+        .into(),
         conversations: dms
             .iter()
             .map(|(id, person)| Conversation {
@@ -3781,6 +3956,7 @@ fn discord_friends_are_listed_and_messaged() {
                 people: 2,
                 ..Default::default()
             })
+            .map(Arc::new)
             .collect(),
         ..Default::default()
     };
@@ -3854,7 +4030,7 @@ fn a_profile_card_messages_its_person_in_their_dm() {
     let snapshot = |dms: &[(&str, &str)]| Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        friends: vec!["2".into(), "3".into()],
+        friends: vec!["2".into(), "3".into()].into(),
         conversations: dms
             .iter()
             .map(|(id, person)| Conversation {
@@ -3864,6 +4040,7 @@ fn a_profile_card_messages_its_person_in_their_dm() {
                 people: 2,
                 ..Default::default()
             })
+            .map(Arc::new)
             .collect(),
         ..Default::default()
     };
@@ -3967,7 +4144,11 @@ fn a_one_to_one_dm_shows_its_persons_profile_beside_it() {
     let mut app = Application::default();
     app.apply(discord_event(Snapshot {
         status: Status::Online,
-        conversations: vec![dm("30", "7", 2), dm("31", "8", 2), dm("32", "9", 3)],
+        conversations: vec![
+            Arc::new(dm("30", "7", 2)),
+            Arc::new(dm("31", "8", 2)),
+            Arc::new(dm("32", "9", 3)),
+        ],
         ..Default::default()
     }));
     assert_eq!(app.state.selected.as_deref(), Some("discord:@me:30"));
@@ -4057,14 +4238,14 @@ fn discord_message_requests_are_answered_not_written_to() {
     use yapfast_discord::service::{Conversation, Snapshot, Status};
     let snapshot = |request: bool| Snapshot {
         status: Status::Online,
-        conversations: vec![Conversation {
+        conversations: vec![Arc::new(Conversation {
             id: "40".into(),
             name: "Erin".into(),
             people: 2,
             request,
             unread: true,
             ..Default::default()
-        }],
+        })],
         ..Default::default()
     };
     let mut app = Application::default();
@@ -4111,21 +4292,21 @@ fn discord_dm_calls_start_ring_and_are_answered() {
         status: Status::Online,
         user_id: Some("1".into()),
         conversations: vec![
-            Conversation {
+            Arc::new(Conversation {
                 id: "30".into(),
                 name: "Ann".into(),
                 people: 2,
                 person: Some("2".into()),
                 ringing,
                 ..Default::default()
-            },
-            Conversation {
+            }),
+            Arc::new(Conversation {
                 id: "40".into(),
                 name: "Erin".into(),
                 people: 2,
                 request: true,
                 ..Default::default()
-            },
+            }),
         ],
         voice: [("30".to_owned(), in_call)].into(),
         ..Default::default()
@@ -4201,7 +4382,7 @@ fn do_not_disturb_shows_a_call_without_notifying() {
         status: Status::Online,
         user_id: Some("1".into()),
         presence: DO_NOT_DISTURB.into(),
-        conversations: vec![Conversation {
+        conversations: vec![Arc::new(Conversation {
             id: "30".into(),
             name: "Ann".into(),
             people: 2,
@@ -4212,7 +4393,7 @@ fn do_not_disturb_shows_a_call_without_notifying() {
                 ..ann.clone()
             }],
             ..Default::default()
-        }],
+        })],
         voice: [("30".to_owned(), vec![ann])].into(),
         ..Default::default()
     }));
@@ -4299,7 +4480,7 @@ fn links_discord_by_qr_code_and_unlinks_it() {
     app.apply(discord_event(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        friends: vec!["2".into()],
+        friends: vec!["2".into()].into(),
         ..Default::default()
     }));
     assert!(matches!(
@@ -4606,8 +4787,8 @@ fn discord_friend_requests_are_sent_answered_and_cancelled() {
     let effects = app.apply(discord_event(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        friends: vec!["2".into()],
-        friend_requests: vec![request("3", "Erin", true), request("4", "Dave", false)],
+        friends: vec!["2".into()].into(),
+        friend_requests: vec![request("3", "Erin", true), request("4", "Dave", false)].into(),
         ..Default::default()
     }));
     assert!(
@@ -4721,6 +4902,7 @@ fn custom_emoji_are_requested_only_for_nearby_messages_and_stale_views_are_ignor
     let view = |room: &str, from, until| Action::VisibleMessages {
         room: room.into(),
         items: (from..until).map(|index| format!("e:${index}")).collect(),
+        at_end: false,
     };
     assert_eq!(asked(app.dispatch(view("dm", 90, 100))).len(), 10);
     assert!(asked(app.dispatch(view("dm", 90, 100))).is_empty());
@@ -4811,6 +4993,39 @@ fn pictures_off_screen_go_once_many_have_arrived() {
 }
 
 #[test]
+fn avatars_stay_only_near_the_rows_on_screen() {
+    let mut app = connected();
+    // A busy channel followed for a while: each message someone else's.
+    let messages: Vec<_> = (0..300)
+        .map(|index| ChatMessage {
+            avatar: Some(format!("{index}.png")),
+            ..message(&format!("e:${index}"), false)
+        })
+        .collect();
+    app.apply(Event::Timeline {
+        room: "dm".into(),
+        messages: timeline(messages),
+    });
+    app.dispatch(Action::VisibleMessages {
+        room: "dm".into(),
+        items: (280..290).map(|index| format!("e:${index}")).collect(),
+        at_end: false,
+    });
+    for index in 0..=KEPT_PICTURES {
+        app.requested_pictures.insert(format!("{index}.png"));
+        app.apply(Event::Picture {
+            url: format!("{index}.png"),
+            picture: Arc::new(Picture::default()),
+        });
+    }
+    let kept = |index: usize| app.state.pictures.contains_key(&format!("{index}.png"));
+    assert!(kept(280) && kept(289), "those on screen stay");
+    assert!(kept(250) && kept(299), "as do those a short scroll away");
+    assert!(!kept(249) && !kept(0), "the rest of the timeline's go");
+    assert_eq!(app.state.pictures.len(), 50);
+}
+
+#[test]
 fn custom_emoji_kept_do_not_let_other_pictures_pile_up() {
     let mut app = connected();
     let mut arrive = |url: String| {
@@ -4842,25 +5057,33 @@ fn unread_channel(unread: bool, last_read: u64) -> Event {
     };
     discord_event(Snapshot {
         status: Status::Online,
-        servers: vec![Arc::new(Server {
-            id: "10".into(),
-            name: "Test".into(),
-            text_channels: vec![
-                Channel {
-                    id: "21".into(),
-                    name: "general".into(),
+        servers: vec![marked(
+            Server {
+                id: "10".into(),
+                name: "Test".into(),
+                text_channels: vec![
+                    Channel {
+                        id: "21".into(),
+                        name: "general".into(),
+                        ..Default::default()
+                    },
+                    Channel {
+                        id: "22".into(),
+                        name: "news".into(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            &[(
+                "21",
+                ChannelMarks {
                     unread,
                     last_read,
                     ..Default::default()
                 },
-                Channel {
-                    id: "22".into(),
-                    name: "news".into(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        })],
+            )],
+        )],
         ..Default::default()
     })
 }
@@ -4938,6 +5161,68 @@ fn the_new_divider_marks_the_first_unread_message_until_the_channel_is_left() {
     assert_eq!(app.state.first_unread, None);
     assert!(app.dispatch(Action::JumpToUnread).is_empty());
     assert_eq!(app.state.unread_jump, 2);
+}
+
+#[test]
+#[cfg(feature = "discord")]
+fn a_channel_whose_new_messages_dont_show_reads_once_its_newest_came() {
+    let general = "discord:10:21";
+    let latest = |history| Event::HistoryLoaded {
+        room: general.into(),
+        direction: chat::Direction::Latest,
+        history,
+    };
+    let reads = |effects: &[Effect]| {
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Backend(Command::MarkRead { room, .. }) if room == general))
+    };
+    let mut app = connected();
+    // Discord's newest message is 104, deleted, of a kind Yapfast doesn't
+    // show or hidden as blocked.
+    app.apply(unread_channel(true, 103));
+    app.dispatch(Action::Navigate(Navigation::Server("discord:10".into())));
+    app.dispatch(Action::SelectRoom(general.into()));
+    app.dispatch(Action::Reading(true));
+    // What was kept on disk shows first; newer messages may come with the
+    // newest page.
+    let effects = app.apply(Event::Timeline {
+        room: general.into(),
+        messages: timeline(discord_messages(95..=103, &[])),
+    });
+    assert!(!reads(&effects));
+    assert!(!reads(&app.apply(latest(chat::History::Failed))));
+    assert!(!reads(&app.dispatch(Action::Reading(true))));
+
+    // The newest page came with nothing new: no divider, and the channel reads.
+    app.apply(Event::Timeline {
+        room: general.into(),
+        messages: timeline(discord_messages(95..=103, &[])),
+    });
+    let effects = app.apply(latest(chat::History::Loaded {
+        start: false,
+        present: true,
+    }));
+    assert!(reads(&effects));
+    assert_eq!(app.state.first_unread, None);
+    assert!(app.state.caught_up);
+
+    // When it brings new messages, the divider goes above them as before,
+    // and the view goes there first.
+    app.dispatch(Action::SelectRoom("discord:10:22".into()));
+    app.apply(unread_channel(true, 103));
+    app.dispatch(Action::SelectRoom(general.into()));
+    app.dispatch(Action::Reading(true));
+    app.apply(Event::Timeline {
+        room: general.into(),
+        messages: timeline(discord_messages(95..=106, &[])),
+    });
+    let effects = app.apply(latest(chat::History::Loaded {
+        start: false,
+        present: true,
+    }));
+    assert!(!reads(&effects));
+    assert_eq!(app.state.first_unread.as_deref(), Some("d:104"));
 }
 
 #[test]
@@ -5181,27 +5466,35 @@ fn the_thread_beside_highlights_new_replies_from_its_own_read_point() {
     let snapshot = |last_read: u64| {
         discord_event(Snapshot {
             status: Status::Online,
-            servers: vec![Arc::new(Server {
-                id: "10".into(),
-                name: "Test".into(),
-                text_channels: vec![Channel {
-                    id: "21".into(),
-                    name: "general".into(),
-                    ..Default::default()
-                }],
-                threads: vec![Channel {
-                    id: "30".into(),
-                    name: "Plans".into(),
-                    parent: Some("21".into()),
-                    last_read,
-                    thread: Some(Box::new(Thread {
-                        joined: true,
+            servers: vec![marked(
+                Server {
+                    id: "10".into(),
+                    name: "Test".into(),
+                    text_channels: vec![Channel {
+                        id: "21".into(),
+                        name: "general".into(),
                         ..Default::default()
-                    })),
+                    }],
+                    threads: vec![Channel {
+                        id: "30".into(),
+                        name: "Plans".into(),
+                        parent: Some("21".into()),
+                        thread: Some(Box::new(Thread {
+                            joined: true,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }],
                     ..Default::default()
-                }],
-                ..Default::default()
-            })],
+                },
+                &[(
+                    "30",
+                    ChannelMarks {
+                        last_read,
+                        ..Default::default()
+                    },
+                )],
+            )],
             ..Default::default()
         })
     };
@@ -5266,16 +5559,94 @@ fn discord_dms(extra: Vec<yapfast_discord::service::Conversation>) -> Applicatio
     app.apply(discord_event(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        friends: vec!["2".into(), "3".into(), "4".into()],
+        friends: vec!["2".into(), "3".into(), "4".into()].into(),
         friend_list: vec![
             friend("2", "Annie"),
             friend("3", "Ben"),
             friend("4", "Cara"),
-        ],
-        conversations,
+        ]
+        .into(),
+        conversations: conversations.into_iter().map(Arc::new).collect(),
         ..Default::default()
     }));
     app
+}
+
+#[test]
+#[cfg(feature = "discord")]
+fn leaving_a_group_dm_asks_first_and_may_tell_no_one() {
+    use MenuChoice::*;
+    let mut app = discord_dms(vec![]);
+    let group = "discord:@me:31".to_owned();
+    // After muting, as in Discord's menu; a one-to-one DM closes instead.
+    assert_eq!(
+        app.state.menu_choices(&group),
+        [Pin, Call, Mute, LeaveGroup, CopyLink, CopyId]
+    );
+    assert!(
+        !app.state
+            .menu_choices("discord:@me:30")
+            .contains(&LeaveGroup)
+    );
+    assert!(
+        app.dispatch(Action::AskLeaveGroup("discord:@me:30".into()))
+            .is_empty()
+            && app.state.leave.is_none()
+    );
+
+    app.dispatch(Action::SelectRoom(group.clone()));
+    assert!(
+        app.dispatch(Action::AskLeaveGroup(group.clone()))
+            .is_empty()
+    );
+    let dialog = app.state.leave.clone().unwrap();
+    assert_eq!(
+        (dialog.place.as_str(), dialog.name.as_str()),
+        (group.as_str(), "Hikers")
+    );
+    assert!(
+        dialog.group && !dialog.silent,
+        "telling the others, unless ticked"
+    );
+    app.dispatch(Action::ToggleSilentLeave);
+    assert!(app.state.leave.as_ref().unwrap().silent);
+    assert!(matches!(
+        app.dispatch(Action::Leave).as_slice(),
+        [Effect::Backend(Command::Discord(DiscordCommand::LeaveGroup { room, silent: true }))]
+            if *room == group
+    ));
+    app.dispatch(Action::ToggleSilentLeave);
+    assert!(
+        app.state.leave.as_ref().unwrap().silent,
+        "not while it's leaving"
+    );
+    app.apply(Event::Left {
+        place: group.clone(),
+        result: Err("Couldn't leave the group: no".into()),
+    });
+    let dialog = app.state.leave.clone().unwrap();
+    assert!(!dialog.leaving && dialog.silent);
+    assert_eq!(
+        dialog.error.as_deref(),
+        Some("Couldn't leave the group: no")
+    );
+    app.dispatch(Action::Leave);
+    app.apply(Event::Left {
+        place: group.clone(),
+        result: Ok(()),
+    });
+    assert!(app.state.leave.is_none());
+    // Its CHANNEL_DELETE takes it out of the DM list, and off the screen.
+    let mut snapshot = yapfast_discord::service::Snapshot::clone(app.discord.as_ref().unwrap());
+    snapshot.conversations.retain(|known| known.id != "31");
+    app.apply(discord_event(snapshot));
+    assert!(app.state.rooms.iter().all(|room| room.id != group));
+    assert_ne!(app.state.selected.as_deref(), Some(group.as_str()));
+
+    // Discord takes it only while connected.
+    let mut app = discord_dms(vec![]);
+    app.state.discord_online = false;
+    assert!(!app.state.menu_choices(&group).contains(&LeaveGroup));
 }
 
 #[test]
@@ -5476,7 +5847,7 @@ fn discord_server() -> Application {
         service::{Snapshot, Status},
     };
     let bits = |bits: u64| bits.to_string();
-    let mut server = ready::server(&serde_json::json!({
+    let server = ready::server(&serde_json::json!({
         "id": "10", "owner_id": "99",
         "properties": {"name": "Test", "default_message_notifications": 1},
         "roles": [
@@ -5498,9 +5869,8 @@ fn discord_server() -> Application {
         ],
     }))
     .unwrap();
-    server.my_roles = vec!["20".into()];
     let soon = crate::clock::now_ms() + 3_600_000;
-    server.notifications = Arc::new(Settings {
+    let notifications = Arc::new(Settings {
         hide_muted_channels: true,
         suppress_roles: true,
         overrides: [
@@ -5529,15 +5899,29 @@ fn discord_server() -> Application {
     });
     // As the service marks them: #news is muted, #memes is muted and
     // mentions her since she read its message "d:3".
-    server.text_channels[1].muted = true;
-    server.text_channels[2].muted = true;
-    server.text_channels[2].mentions = 1;
-    server.text_channels[2].last_read = 3;
+    let marks = ServerMarks {
+        roles: vec!["20".into()],
+        notifications,
+        ..Default::default()
+    };
+    let server = MarkedServer::marked(server, marks, |channel| match channel.id.as_str() {
+        "12" => ChannelMarks {
+            muted: true,
+            ..Default::default()
+        },
+        "13" => ChannelMarks {
+            muted: true,
+            mentions: 1,
+            last_read: 3,
+            ..Default::default()
+        },
+        _ => ChannelMarks::default(),
+    });
     let mut app = Application::default();
     app.apply(discord_event(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        servers: vec![Arc::new(server)],
+        servers: vec![server],
         ..Default::default()
     }));
     app
@@ -5901,9 +6285,42 @@ fn a_dm_search_closes_in_another_dm() {
 #[cfg(feature = "discord")]
 fn change_server(app: &mut Application, change: impl FnOnce(&mut yapfast_discord::ready::Server)) {
     let mut snapshot = yapfast_discord::service::Snapshot::clone(app.discord.as_ref().unwrap());
-    let mut server = yapfast_discord::ready::Server::clone(&snapshot.servers[0]);
-    change(&mut server);
-    snapshot.servers[0] = Arc::new(server);
+    let listed = &mut snapshot.servers[0];
+    // Each channel keeps its marks, wherever the change puts it.
+    let was: HashMap<String, ChannelMarks> = listed
+        .channels()
+        .map(|channel| (channel.id.clone(), channel.marks))
+        .collect();
+    change(Arc::make_mut(&mut listed.server));
+    let channels = listed
+        .channels()
+        .map(|channel| was.get(&channel.id).copied().unwrap_or_default())
+        .collect();
+    Arc::make_mut(&mut listed.marks).channels = channels;
+    app.apply(discord_event(snapshot));
+}
+
+/// `server` with `marks` for the channels they name by id, and the
+/// defaults for the rest.
+#[cfg(feature = "discord")]
+fn marked(server: yapfast_discord::ready::Server, marks: &[(&str, ChannelMarks)]) -> MarkedServer {
+    MarkedServer::marked(server, ServerMarks::default(), |channel| {
+        marks
+            .iter()
+            .find(|(id, _)| *id == channel.id)
+            .map_or_else(ChannelMarks::default, |(_, marks)| *marks)
+    })
+}
+
+/// Changes this account's marks in the first server, as a snapshot would.
+#[cfg(feature = "discord")]
+fn change_marks(
+    app: &mut Application,
+    change: impl FnOnce(&yapfast_discord::ready::Server, &mut ServerMarks),
+) {
+    let mut snapshot = yapfast_discord::service::Snapshot::clone(app.discord.as_ref().unwrap());
+    let listed = &mut snapshot.servers[0];
+    change(&listed.server, Arc::make_mut(&mut listed.marks));
     app.apply(discord_event(snapshot));
 }
 
@@ -5965,14 +6382,14 @@ fn server_channels_pin_to_the_top_as_discords_client_pins_them() {
 
     // Discord's word: Lounge, a voice channel, lists after #memes and
     // #news, by position, though it came first.
-    change_server(&mut app, |server| {
+    change_marks(&mut app, |_, marks| {
         let mut settings =
-            yapfast_discord::notifications::Notifications::clone(&server.notifications);
+            yapfast_discord::notifications::Notifications::clone(&marks.notifications);
         for (channel, flags) in [("14", 6144), ("13", 6144), ("12", 2048 | 1024)] {
             let known = settings.overrides.entry(channel.into()).or_default();
             *known = Override { flags, ..*known };
         }
-        server.notifications = Arc::new(settings);
+        marks.notifications = Arc::new(settings);
     });
     assert_eq!(
         app.state.servers[0].pinned,
@@ -6014,9 +6431,10 @@ fn a_community_server_lists_only_the_channels_followed_as_discords_client_does()
             .iter()
             .map(|(channel, flags)| ((*channel).to_owned(), *flags))
             .collect();
-        change_server(app, move |server| {
+        change_server(app, |server| server.community = true);
+        change_marks(app, move |_, marks| {
             let mut settings =
-                yapfast_discord::notifications::Notifications::clone(&server.notifications);
+                yapfast_discord::notifications::Notifications::clone(&marks.notifications);
             // Muted channels show, to see only what following hides.
             settings.hide_muted_channels = false;
             settings.flags = server_flags;
@@ -6024,8 +6442,7 @@ fn a_community_server_lists_only_the_channels_followed_as_discords_client_does()
                 let known = settings.overrides.entry(channel).or_default();
                 *known = Override { flags, ..*known };
             }
-            server.notifications = Arc::new(settings);
-            server.community = true;
+            marks.notifications = Arc::new(settings);
         });
     };
     let follow = |app: &mut Application, room: &str, follow| match app
@@ -6165,16 +6582,16 @@ fn browse_channels_ticks_the_channels_followed_as_discords_client_does() {
             .iter()
             .map(|(channel, flags)| ((*channel).to_owned(), *flags))
             .collect();
-        change_server(app, move |server| {
+        change_server(app, |server| server.community = true);
+        change_marks(app, move |_, marks| {
             let mut settings =
-                yapfast_discord::notifications::Notifications::clone(&server.notifications);
+                yapfast_discord::notifications::Notifications::clone(&marks.notifications);
             settings.flags = server_flags;
             for (channel, flags) in flags {
                 let known = settings.overrides.entry(channel).or_default();
                 *known = Override { flags, ..*known };
             }
-            server.notifications = Arc::new(settings);
-            server.community = true;
+            marks.notifications = Arc::new(settings);
         });
     };
     fn ticked(app: &Application) -> Vec<(&str, bool, bool)> {
@@ -6319,14 +6736,14 @@ fn a_discord_servers_menu_and_header_offer_its_notifications() {
          notifications after its link"
     );
 
-    change_server(&mut app, |server| {
+    change_marks(&mut app, |_, marks| {
         let mut settings =
-            yapfast_discord::notifications::Notifications::clone(&server.notifications);
+            yapfast_discord::notifications::Notifications::clone(&marks.notifications);
         settings.mute = yapfast_discord::notifications::Mute {
             muted: true,
             until: None,
         };
-        server.notifications = Arc::new(settings);
+        marks.notifications = Arc::new(settings);
     });
     assert_eq!(app.menu_choices("discord:10")[1], UnmuteServer);
 
@@ -6367,9 +6784,9 @@ fn a_discord_category_has_a_menu_that_marks_its_channels_read() {
         app.dispatch(Action::MarkRead("discord:10:4".into())).as_slice(),
         [Effect::Backend(Command::MarkRead { room, .. })] if room == "discord:10:13"
     ));
-    change_server(&mut app, |server| {
-        for channel in &mut server.text_channels {
-            channel.mentions = 0;
+    change_marks(&mut app, |server, marks| {
+        for channel in &server.text_channels {
+            marks.channel_mut(server, &channel.id).unwrap().mentions = 0;
         }
     });
     assert_eq!(
@@ -6783,16 +7200,16 @@ fn leaving_a_discord_server_asks_first_and_is_not_for_its_owner() {
     );
     let dialog = app.state.leave.clone().unwrap();
     assert_eq!(
-        (dialog.server.as_str(), dialog.name.as_str()),
+        (dialog.place.as_str(), dialog.name.as_str()),
         ("discord:10", "Test")
     );
     assert!(matches!(
-        app.dispatch(Action::LeaveServer).as_slice(),
+        app.dispatch(Action::Leave).as_slice(),
         [Effect::Backend(Command::Discord(DiscordCommand::LeaveServer { server }))] if server == "discord:10"
     ));
-    assert!(app.dispatch(Action::LeaveServer).is_empty(), "once");
-    app.apply(Event::LeftServer {
-        server: server.clone(),
+    assert!(app.dispatch(Action::Leave).is_empty(), "once");
+    app.apply(Event::Left {
+        place: server.clone(),
         result: Err("Couldn't leave the server: no".into()),
     });
     let dialog = app.state.leave.clone().unwrap();
@@ -6801,9 +7218,9 @@ fn leaving_a_discord_server_asks_first_and_is_not_for_its_owner() {
         dialog.error.as_deref(),
         Some("Couldn't leave the server: no")
     );
-    app.dispatch(Action::LeaveServer);
-    app.apply(Event::LeftServer {
-        server: server.clone(),
+    app.dispatch(Action::Leave);
+    app.apply(Event::Left {
+        place: server.clone(),
         result: Ok(()),
     });
     assert!(app.state.leave.is_none());
@@ -7234,15 +7651,22 @@ fn a_channels_threads_list_as_discords_client_lists_them() {
     // As the service publishes them, a private one she isn't in is hidden.
     for channel in &mut server.threads {
         channel.thread.as_mut().unwrap().joined = channel.id == "30";
-        if channel.id == "33" {
-            channel.access = Access::Hidden;
-        }
     }
+    let server = marked(
+        server,
+        &[(
+            "33",
+            ChannelMarks {
+                access: Access::Hidden,
+                ..Default::default()
+            },
+        )],
+    );
     let mut app = Application::default();
     app.apply(discord_event(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        servers: vec![Arc::new(server)],
+        servers: vec![server],
         ..Default::default()
     }));
     app.dispatch(Action::Navigate(Navigation::Server("discord:10".into())));
@@ -7394,7 +7818,7 @@ fn a_poll_is_made_in_discords_dialog_where_polls_may_go() {
     app.apply(Event::Discord(Arc::new(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        servers: vec![Arc::new(server)],
+        servers: vec![MarkedServer::from(server)],
         ..Default::default()
     })));
     app.dispatch(Action::Navigate(Navigation::Server("discord:10".into())));
@@ -7549,7 +7973,7 @@ fn a_thread_starts_from_discords_new_thread_form() {
         Event::Discord(Arc::new(Snapshot {
             status: Status::Online,
             user_id: Some("1".into()),
-            servers: vec![Arc::new(server)],
+            servers: vec![MarkedServer::from(server)],
             ..Default::default()
         }))
     };
@@ -7960,7 +8384,7 @@ fn favourite_gifs_show_from_disk_and_stars_wait_for_discords() {
     };
     app.apply(discord_event(yapfast_discord::service::Snapshot {
         status: yapfast_discord::service::Status::Online,
-        servers: vec![Arc::new(yapfast_discord::ready::Server {
+        servers: vec![MarkedServer::from(yapfast_discord::ready::Server {
             id: "10".into(),
             name: "Test".into(),
             text_channels: vec![yapfast_discord::ready::Channel {
@@ -8043,7 +8467,7 @@ fn the_gif_picker_searches_sends_and_keeps_favorites() {
     let mut app = connected();
     app.apply(discord_event(yapfast_discord::service::Snapshot {
         status: yapfast_discord::service::Status::Online,
-        servers: vec![Arc::new(Server {
+        servers: vec![MarkedServer::from(Server {
             id: "10".into(),
             name: "Test".into(),
             text_channels: vec![Channel {
@@ -8237,17 +8661,20 @@ fn a_forum_shows_its_posts_as_discords_client_does() {
         .unwrap();
         // Read up to the joined post, which she opened; the newest she never
         // opened.
-        for channel in server.text_channels.iter_mut().chain(&mut server.threads) {
-            channel.last_read = 45;
+        for channel in &mut server.threads {
             if let Some(thread) = channel.thread.as_deref_mut() {
-                thread.opened = channel.id == "45";
                 thread.joined = channel.id == "45";
             }
         }
+        let server = MarkedServer::marked(server, ServerMarks::default(), |channel| ChannelMarks {
+            last_read: 45,
+            opened: channel.thread.is_some() && channel.id == "45",
+            ..Default::default()
+        });
         discord_event(Snapshot {
             status: Status::Online,
             user_id: Some("1".into()),
-            servers: vec![Arc::new(server)],
+            servers: vec![server],
             ..Default::default()
         })
     };
@@ -8422,7 +8849,7 @@ fn a_forum_post_needs_a_title_a_message_and_a_tag_the_forum_requires() {
     app.apply(discord_event(Snapshot {
         status: Status::Online,
         user_id: Some("1".into()),
-        servers: vec![Arc::new(server)],
+        servers: vec![MarkedServer::from(server)],
         ..Default::default()
     }));
     app.dispatch(Action::Navigate(Navigation::Server("discord:10".into())));
@@ -8610,7 +9037,7 @@ fn join_a_server_shows_the_invite_and_joins_on_the_click() {
         "channels": [{"id": "21", "type": 0, "name": "general", "position": 0}],
     }))
     .unwrap();
-    snapshot.servers.push(Arc::new(joined));
+    snapshot.servers.push(MarkedServer::from(joined));
     app.apply(discord_event(snapshot));
     assert_eq!(app.state.selected.as_deref(), Some("discord:20:21"));
     assert_eq!(

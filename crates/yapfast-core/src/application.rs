@@ -13,7 +13,7 @@ use crate::{
     discord,
     mention::{self, Candidate, Target},
     network::Network,
-    voice::{self, Phase},
+    voice::{self, JoinSound, Phase},
 };
 
 mod arrange;
@@ -24,7 +24,6 @@ mod channel_settings;
 mod compose;
 mod discord_account;
 mod forum;
-mod forward_places;
 mod gifs;
 mod header;
 mod join;
@@ -32,6 +31,7 @@ mod members;
 mod messages;
 mod mfa;
 mod new_post;
+mod place_search;
 mod places;
 mod polls;
 mod preview;
@@ -58,6 +58,7 @@ pub use members::{BAN_HISTORY, RoleChoice, TIMEOUT_TIMES};
 pub use members::{member_server, with_clubs};
 pub use mfa::MfaPrompt;
 pub use new_post::{NewPost, POST_TAGS, POST_TITLE_LIMIT};
+pub use place_search::Place;
 pub use places::{
     ChannelAsk, ChannelDialog, INVITE_AGES, INVITE_USES, InviteDialog, LeaveDialog, ListedCategory,
     SLOWMODES,
@@ -301,8 +302,9 @@ pub struct Forwarding {
     pub pinned: Vec<String>,
 }
 
-/// The Discord conversations this account used, which rank where a message
-/// is forwarded; see [`AppState::forward_places`].
+/// The conversations this account used, which rank where a message is
+/// forwarded and where the quick switcher goes; see
+/// [`AppState::forward_places`] and [`AppState::switcher_places`].
 #[derive(Default)]
 pub struct PlacesUsed {
     /// By Discord server or channel id, as Discord's clients counted them,
@@ -311,12 +313,14 @@ pub struct PlacesUsed {
     /// This session's uses, by channel id, added again to each count that
     /// comes.
     pending: Vec<(String, u64)>,
-    /// The Discord conversations opened this session, the latest first, up
-    /// to eight.
+    /// The conversations opened this session, of every network, the latest
+    /// first, up to sixteen.
     visited: Vec<String>,
     /// Discord's counts came, or were asked for.
     fresh: bool,
     asked: bool,
+    /// Counts changes to the counts and to those opened lately.
+    changes: u64,
 }
 
 /// A forward sent, until each conversation it went to answers.
@@ -397,10 +401,10 @@ pub struct AppState {
     /// `invisible`.
     pub discord_presence: Option<String>,
     /// Its friends, by user id, and friend requests waiting for an answer.
-    pub discord_friends: Vec<String>,
-    /// Those it blocked and those it ignores, by user id.
-    pub discord_blocked: Vec<String>,
-    pub discord_ignored: Vec<String>,
+    pub discord_friends: Arc<[String]>,
+    /// Those it blocked, by name, and those it ignores, by user id.
+    pub discord_blocked: Vec<chat::Blocked>,
+    pub discord_ignored: Arc<[String]>,
     /// DMs pinned to the top of the DM list on this device, by room id, the
     /// first pinned first.
     pub pinned: Vec<String>,
@@ -412,7 +416,7 @@ pub struct AppState {
     /// The dialog that makes, changes or deletes a Discord channel or
     /// category, while it's open.
     pub channel_dialog: Option<ChannelDialog>,
-    /// Asks before leaving a Discord server, while it's open.
+    /// Asks before leaving a Discord server or group DM, while it's open.
     pub leave: Option<LeaveDialog>,
     /// Asks whether a channel dragged into a category takes its
     /// permissions, while it's open.
@@ -437,6 +441,15 @@ pub struct AppState {
     /// it shows.
     pub discord_show_game: bool,
     pub discord_playing: Option<chat::Playing>,
+    /// How loud the Discord account's soundboard plays, as Discord keeps
+    /// it: from 0 to 100, on its slider's curve.
+    pub soundboard_volume: f32,
+    /// The Discord account's join sounds: each one's server, none for
+    /// every server without its own, then its sound's id and its sound's
+    /// own server.
+    pub join_sounds: Vec<JoinSound>,
+    /// Every sound a join sound may be, once Settings asked for them.
+    pub sound_catalog: Option<Arc<[voice::SoundGroup]>>,
     /// A Discord account is linked on this device, whether or not it's
     /// connected, and linking one, while that's under way.
     pub discord_linked: bool,
@@ -480,8 +493,9 @@ pub struct AppState {
     pub online: bool,
     pub storage: Option<&'static str>,
     pub notice: Option<String>,
-    pub rooms: Vec<ChatRoom>,
-    pub servers: Vec<ChatServer>,
+    /// Shared with the networks' lists they're shown from.
+    pub rooms: Vec<Arc<ChatRoom>>,
+    pub servers: Vec<Arc<ChatServer>>,
     /// Who else is typing, by room.
     pub typing: HashMap<String, Vec<String>>,
     /// The `@` word being typed in the composer, if any.
@@ -502,6 +516,10 @@ pub struct AppState {
     /// decide who sees them, so a client can tell when
     /// [`Application::categories`] may list others.
     pub category_changes: u64,
+    /// Counts changes to [`Self::rooms`] and [`Self::servers`], so a client
+    /// can tell when its own copies of them are out of date. Whatever
+    /// changes either counts it.
+    pub list_changes: u64,
     pub navigation: Navigation,
     pub selected: Option<String>,
     /// The selected voice channel shows its chat in place of its call.
@@ -562,6 +580,8 @@ pub struct AppState {
     /// A message being forwarded, while its dialog is open.
     pub forwarding: Option<Forwarding>,
     pub places_used: PlacesUsed,
+    /// What the quick switcher searches for, while it's open.
+    pub switcher: Option<String>,
     pub new_dm: Option<NewDm>,
     /// The selected DM's pinned messages, a search of it, and adding friends
     /// to it, each while it's open.
@@ -615,6 +635,7 @@ impl AppState {
     pub fn selected_room(&self) -> Option<&ChatRoom> {
         self.rooms
             .iter()
+            .map(Arc::as_ref)
             .find(|room| Some(&room.id) == self.selected.as_ref())
     }
 
@@ -684,6 +705,32 @@ impl AppState {
             .filter(|room| room.direct && room.members <= 2 && room.person.is_some())
     }
 
+    /// A dialog that takes the keyboard is open, over which the quick
+    /// switcher doesn't open.
+    fn dialog_open(&self) -> bool {
+        !self.mfa.is_empty()
+            || self.forwarding.is_some()
+            || self.new_dm.is_some()
+            || self.add_friend.is_some()
+            || self.status_editor.is_some()
+            || self.person_dialog.is_some()
+            || self.invite.is_some()
+            || self.join.is_some()
+            || self.channel_dialog.is_some()
+            || self.leave.is_some()
+            || self.move_sync.is_some()
+            || self.profile_editor.is_some()
+            || self.server_settings.is_some()
+            || self.channel_settings.is_some()
+            || self.poll_draft.is_some()
+            || self.confirm_delete.is_some()
+            || self.confirm_end_poll.is_some()
+            || self.reactions.is_some()
+            || self.add_people.is_some()
+            || self.switch_voice.is_some()
+            || self.viewer.is_some()
+    }
+
     pub fn in_scope(&self, room: &ChatRoom) -> bool {
         match &self.navigation {
             Navigation::DirectMessages => room.direct,
@@ -733,16 +780,19 @@ impl AppState {
             })
             .map(|room| room.parent.as_deref().unwrap_or(&room.id))
             .collect();
-        self.rooms.iter().filter(move |room| match &channels {
-            None => room.direct,
-            Some(channels) => {
-                !room.direct
-                    && channels.contains(room.id.as_str())
-                    && !(hide_muted && self.hidden_muted(room))
-                    && !(room.unlisted
-                        && !shown.contains(room.parent.as_deref().unwrap_or(&room.id)))
-            }
-        })
+        self.rooms
+            .iter()
+            .map(Arc::as_ref)
+            .filter(move |room| match &channels {
+                None => room.direct,
+                Some(channels) => {
+                    !room.direct
+                        && channels.contains(room.id.as_str())
+                        && !(hide_muted && self.hidden_muted(room))
+                        && !(room.unlisted
+                            && !shown.contains(room.parent.as_deref().unwrap_or(&room.id)))
+                }
+            })
     }
 
     /// Who else is typing in the open conversation, as the composer says it; empty
@@ -805,7 +855,7 @@ impl AppState {
         if let Some(person) = self
             .selected_room()
             .into_iter()
-            .chain(&self.rooms)
+            .chain(self.rooms.iter().map(Arc::as_ref))
             .flat_map(|room| &room.people)
             .find(|person| person.id == user)
         {
@@ -1013,6 +1063,13 @@ impl AppState {
         }
     }
 
+    /// Whether this Discord account blocked a Discord user.
+    pub fn is_blocked(&self, user: &str) -> bool {
+        self.discord_blocked
+            .iter()
+            .any(|blocked| blocked.id == user)
+    }
+
     /// The selected conversation, when it's a DM or group DM whose network
     /// lets it do what `can` asks, and not a message request.
     pub fn dm_that(
@@ -1217,6 +1274,13 @@ pub enum Action {
     /// Forward it to those chosen, with this message added.
     Forward(String),
     CloseForward,
+    /// Open the quick switcher, or close it if it's open.
+    ToggleSwitcher,
+    /// Search the places it goes to.
+    SearchSwitcher(String),
+    /// Go to a conversation or server it found, and close it.
+    SwitchTo(String),
+    CloseSwitcher,
     ConfirmDelete,
     CancelDelete,
     Retry(String),
@@ -1261,10 +1325,12 @@ pub enum Action {
     /// message, as the timeline does when scrolled near its top, unless one
     /// is on its way or the first message is loaded.
     Earlier,
-    /// Items in or near the selected timeline's viewport, in timeline order.
+    /// Items in or near the selected timeline's viewport, in timeline order,
+    /// and whether it follows the newest message.
     VisibleMessages {
         room: String,
         items: Vec<String>,
+        at_end: bool,
     },
     /// Show the selected room's message with this item; see
     /// [`AppState::jump`]. When the timeline doesn't have it, the messages
@@ -1544,11 +1610,14 @@ pub enum Action {
         settings: chat::ChannelSettings,
     },
     CloseChannelDialog,
-    /// Ask before leaving a Discord server, by its server id; leave the one
-    /// asked about; or stay.
+    /// Ask before leaving a Discord server, by its server id, or a group
+    /// DM, by its room id; tick or untick leaving the group without telling
+    /// its other members; leave the one asked about; or stay.
     AskLeaveServer(String),
-    LeaveServer,
-    CloseLeaveServer,
+    AskLeaveGroup(String),
+    ToggleSilentLeave,
+    Leave,
+    CloseLeave,
     /// Open the editor of this account's main Discord profile, or of its
     /// profile in a Discord server, by its server id or one of its
     /// channels' room ids; change a text in it; read a picture chosen for
@@ -1682,6 +1751,17 @@ pub enum Action {
     SetStatus(String),
     /// Share the game the Discord account plays, or stop.
     ShowGame(bool),
+    /// Set how loud the Discord account's soundboard plays, on its slider
+    /// from 0 to 100.
+    SoundboardVolume(f32),
+    /// List the sounds the Discord account may join calls with.
+    LoadSoundCatalog,
+    /// Set the Discord account's join sound for `server`, or for every
+    /// server, to the sound with this id, or take it away.
+    SetJoinSound {
+        server: Option<String>,
+        sound: Option<String>,
+    },
     /// Nobody has used Yapfast since then, in Unix milliseconds, or someone is
     /// using it again; and whether that may show Discord idle.
     Inactive {
@@ -1777,8 +1857,8 @@ type TimelineArc = Arc<Vec<Arc<ChatMessage>>>;
 pub struct Application {
     pub state: AppState,
     /// The lists from Matrix; `state` shows them with Discord's.
-    matrix_rooms: Vec<ChatRoom>,
-    matrix_servers: Vec<ChatServer>,
+    matrix_rooms: Vec<Arc<ChatRoom>>,
+    matrix_servers: Vec<Arc<ChatServer>>,
     #[cfg(feature = "discord")]
     discord: Option<Arc<yapfast_discord::service::Snapshot>>,
     /// Discord's lists, made from `discord`.
@@ -1880,6 +1960,22 @@ const LISTED_PICTURES: usize = 150;
 /// decoded, and the window keeps a copy of each it shows. The rail, the DMs
 /// listed, a member list and a timeline show a few hundred at most.
 const KEPT_PICTURES: usize = 400;
+/// Timeline rows either side of those on screen whose avatars stay when
+/// pictures go.
+const PICTURED_AROUND: usize = 30;
+
+/// Where the messages on screen are in `timeline`: from the first to the
+/// last of `visible`, the items the timeline said show; none before it said,
+/// or once they've gone.
+fn visible_range(
+    timeline: &[Arc<ChatMessage>],
+    visible: &[String],
+) -> Option<std::ops::RangeInclusive<usize>> {
+    let (first, last) = visible.first().zip(visible.last())?;
+    let first = timeline.iter().position(|message| &message.item == first)?;
+    let last = timeline.iter().position(|message| &message.item == last)?;
+    (first <= last).then_some(first..=last)
+}
 
 /// The server icons and avatars on screen: the rail, the first DMs listed,
 /// the people in the listed voice channels, the call, `timeline` and the
@@ -2187,27 +2283,8 @@ impl Application {
         let timeline = if Arc::ptr_eq(&self.pictured_timeline, &state.messages) {
             &[][..]
         } else {
-            match self
-                .visible_messages
-                .first()
-                .zip(self.visible_messages.last())
-            {
-                Some((first, last)) => {
-                    let first = state
-                        .messages
-                        .iter()
-                        .position(|message| &message.item == first);
-                    let last = state
-                        .messages
-                        .iter()
-                        .position(|message| &message.item == last);
-                    match first.zip(last) {
-                        Some((first, last)) if first <= last => &state.messages[first..=last],
-                        _ => &[],
-                    }
-                }
-                None => &[],
-            }
+            visible_range(&state.messages, &self.visible_messages)
+                .map_or(&[][..], |range| &state.messages[range])
         };
         let mut wanted = Vec::new();
         // Virtualized UI rows request their own avatars; this covers profiles,
@@ -2258,7 +2335,16 @@ impl Application {
             .aside
             .as_ref()
             .map(|aside| aside.messages.as_slice());
-        let shown: HashSet<String> = pictures_on_screen(&self.state, &self.state.messages, true)
+        // Of a timeline, the rows on screen and those a short scroll away:
+        // one that follows a busy channel can hold thousands, each with
+        // someone else's avatar.
+        let messages = &self.state.messages;
+        let timeline =
+            visible_range(messages, &self.visible_messages).map_or(&messages[..], |range| {
+                let start = range.start().saturating_sub(PICTURED_AROUND);
+                &messages[start..(range.end() + 1 + PICTURED_AROUND).min(messages.len())]
+            });
+        let shown: HashSet<String> = pictures_on_screen(&self.state, timeline, true)
             .chain(
                 aside
                     .into_iter()
@@ -2276,26 +2362,41 @@ impl Application {
 
     fn dispatch_action(&mut self, action: Action) -> Vec<Effect> {
         match action {
-            Action::VisibleMessages { room, items }
-                if self
-                    .state
-                    .aside
-                    .as_ref()
-                    .is_some_and(|aside| aside.room == room) =>
+            Action::VisibleMessages {
+                room,
+                items,
+                at_end,
+            } if self
+                .state
+                .aside
+                .as_ref()
+                .is_some_and(|aside| aside.room == room) =>
             {
                 if self.aside_visible == items {
                     return vec![];
                 }
                 self.aside_visible = items.clone();
-                vec![Effect::Backend(Command::VisibleMessages { room, items })]
+                vec![Effect::Backend(Command::VisibleMessages {
+                    room,
+                    items,
+                    at_end,
+                })]
             }
-            Action::VisibleMessages { room, items } => {
+            Action::VisibleMessages {
+                room,
+                items,
+                at_end,
+            } => {
                 if self.state.selected.as_ref() != Some(&room) || self.visible_messages == items {
                     return vec![];
                 }
                 self.visible_messages = items.clone();
                 self.pictured_timeline = Arc::new(Vec::new());
-                vec![Effect::Backend(Command::VisibleMessages { room, items })]
+                vec![Effect::Backend(Command::VisibleMessages {
+                    room,
+                    items,
+                    at_end,
+                })]
             }
             Action::Navigate(navigation) => self.navigate(navigation),
             Action::OpenDmScreen(screen) => self.open_dm_screen(screen),
@@ -2389,6 +2490,18 @@ impl Application {
             Action::Forward(note) => self.forward(note),
             Action::CloseForward => {
                 self.state.forwarding = None;
+                vec![]
+            }
+            Action::ToggleSwitcher => self.toggle_switcher(),
+            Action::SearchSwitcher(query) => {
+                if let Some(switcher) = &mut self.state.switcher {
+                    *switcher = query;
+                }
+                vec![]
+            }
+            Action::SwitchTo(id) => self.switch_to(id),
+            Action::CloseSwitcher => {
+                self.state.switcher = None;
                 vec![]
             }
             Action::CancelDelete => {
@@ -2633,8 +2746,20 @@ impl Application {
                 vec![]
             }
             Action::AskLeaveServer(server) => self.ask_leave(server),
-            Action::LeaveServer => self.leave_server(),
-            Action::CloseLeaveServer => {
+            Action::AskLeaveGroup(room) => self.ask_leave_group(room),
+            Action::ToggleSilentLeave => {
+                if let Some(dialog) = self
+                    .state
+                    .leave
+                    .as_mut()
+                    .filter(|dialog| dialog.group && !dialog.leaving)
+                {
+                    dialog.silent = !dialog.silent;
+                }
+                vec![]
+            }
+            Action::Leave => self.leave(),
+            Action::CloseLeave => {
                 self.state.leave = None;
                 vec![]
             }
@@ -2803,6 +2928,60 @@ impl Application {
                 vec![Effect::Backend(Command::Discord(DiscordCommand::ShowGame(
                     shown,
                 )))]
+            }
+            Action::SoundboardVolume(slider) => {
+                // Discord keeps the volume on its slider's curve.
+                let volume = crate::volume::from_slider(slider.clamp(0.0, 100.0)) * 100.0;
+                if self.state.preview
+                    || self.state.discord_user.is_none()
+                    || (self.state.soundboard_volume - volume).abs() < 0.01
+                {
+                    return vec![];
+                }
+                self.state.soundboard_volume = volume;
+                vec![Effect::Backend(Command::Discord(
+                    DiscordCommand::SoundboardVolume(volume),
+                ))]
+            }
+            Action::LoadSoundCatalog => {
+                if self.state.preview || self.state.discord_user.is_none() {
+                    return vec![];
+                }
+                vec![Effect::Backend(Command::Discord(
+                    DiscordCommand::SoundCatalog,
+                ))]
+            }
+            Action::SetJoinSound { server, sound } => {
+                if self.state.preview || self.state.discord_user.is_none() {
+                    return vec![];
+                }
+                // The sound's own server, from the sounds Settings offered.
+                let sound = match sound {
+                    None => None,
+                    Some(id) => {
+                        let found = self
+                            .state
+                            .sound_catalog
+                            .iter()
+                            .flat_map(|groups| groups.iter())
+                            .flat_map(|group| &group.sounds)
+                            .find(|sound| sound.id == id);
+                        let Some(found) = found else { return vec![] };
+                        Some((id, found.guild.clone()))
+                    }
+                };
+                // Shown at once; the settings Discord sends back confirm it.
+                self.state.join_sounds.retain(|join| join.server != server);
+                if let Some((id, guild)) = &sound {
+                    self.state.join_sounds.push(JoinSound {
+                        server: server.clone(),
+                        sound: id.clone(),
+                        guild: guild.clone(),
+                    });
+                }
+                vec![Effect::Backend(Command::Discord(
+                    DiscordCommand::SetJoinSound { server, sound },
+                ))]
             }
             Action::Inactive { since, show_idle } => {
                 // Discord keeps it through reconnecting, so it goes even
@@ -2988,8 +3167,9 @@ impl Application {
                 self.state.notice = None;
             }
             Event::Rooms(index) => {
-                self.matrix_rooms = index.rooms;
-                self.matrix_servers = index.servers;
+                // Those that didn't change stay shared with the state's.
+                chat::share_list(&mut self.matrix_rooms, index.rooms);
+                chat::share_list(&mut self.matrix_servers, index.servers);
                 return self.show_lists();
             }
             Event::Image {
@@ -3150,7 +3330,7 @@ impl Application {
             }
             Event::OverwritesChanged { room, result } => self.overwrites_changed(room, result),
             Event::OverwriteNames { room, members } => self.overwrite_names(room, members),
-            Event::LeftServer { server, result } => self.left_server(server, result),
+            Event::Left { place, result } => self.left(place, result),
             Event::ServerDeleted { server, result } => self.server_deleted(server, result),
             Event::ServerTransferred { server, result } => self.server_transferred(server, result),
             Event::ServerPincodeSent { server, result } => self.server_pincode_sent(server, result),
@@ -3289,6 +3469,29 @@ impl Application {
                     self.state.notice = Some(format!("Couldn't change your status: {error}"));
                 }
             }
+            Event::SoundboardVolumeSet(Err(error)) => {
+                self.state.notice = Some(format!("Couldn't change the soundboard volume: {error}"));
+            }
+            Event::JoinSoundSet(Err(error)) => {
+                self.state.notice = Some(format!("Couldn't change your entrance sound: {error}"));
+            }
+            Event::SoundboardVolumeSet(Ok(())) | Event::JoinSoundSet(Ok(())) => {}
+            Event::SoundCatalog(result) => match result {
+                Ok(groups) => {
+                    // The sounds' custom emoji, for the chooser.
+                    let pictures = groups
+                        .iter()
+                        .flat_map(|group| &group.sounds)
+                        .filter_map(|sound| sound.picture.clone())
+                        .collect();
+                    self.state.sound_catalog = Some(groups);
+                    return self.load_pictures(pictures);
+                }
+                Err(error) => {
+                    self.state.notice =
+                        Some(format!("Couldn't list the soundboard's sounds: {error}"));
+                }
+            },
             Event::ShowGameSet(result) => {
                 if let Err(error) = result {
                     self.state.discord_show_game = !self.state.discord_show_game;
@@ -3448,6 +3651,18 @@ impl Application {
             "Connecting to Discord...".into()
         });
         vec![Effect::Start(start)]
+    }
+
+    /// Whether the Discord account has Nitro, which join sounds need.
+    pub fn discord_nitro(&self) -> bool {
+        #[cfg(feature = "discord")]
+        if let Some(snapshot) = &self.discord {
+            return snapshot
+                .account
+                .as_ref()
+                .is_some_and(|account| account.premium_type > 0);
+        }
+        false
     }
 
     /// The custom emoji this account may use in the selected room, by server, the

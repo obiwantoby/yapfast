@@ -203,11 +203,12 @@ impl Application {
                 None => {}
             }
         }
-        // In a voice channel they're in: muting them for this account, or
-        // its own mute and deafen in the call it's in there.
+        // In a voice channel they're in: muting them or their soundboard
+        // for this account, or its own mute and deafen in the call it's in
+        // there.
         let in_voice = self.voice_person(place, user).is_some();
         if in_voice && !me {
-            choices.push(MenuChoice::LocalMute);
+            choices.extend([MenuChoice::LocalMute, MenuChoice::SoundboardMute]);
         } else if in_voice && state.voice.active() && state.voice.room.as_deref() == Some(place) {
             choices.extend([MenuChoice::SelfMute, MenuChoice::SelfDeafen]);
         }
@@ -287,7 +288,7 @@ impl Application {
             .as_ref()
             .and_then(|snapshot| snapshot.names.read().shared_roles(&server.id, user));
         known
-            .or_else(|| (user == me).then(|| server.my_roles.as_slice().into()))
+            .or_else(|| (user == me).then(|| server.marks.roles.as_slice().into()))
             .or_else(|| self.state.person(user).map(|person| person.roles))
             .or_else(|| {
                 self.listed_member(place, user)

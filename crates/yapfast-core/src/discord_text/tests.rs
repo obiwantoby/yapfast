@@ -388,22 +388,28 @@ fn votes_count_live_and_last_through_an_update_without_them() {
 
 #[test]
 fn messages_render_again_once_what_they_show_changes() {
+    use yapfast_discord::marked::{ChannelMarks, MarkedServer, ServerMarks};
     let server = |name: &str, unread: bool| {
-        Some(Arc::new(yapfast_discord::ready::Server {
+        let server = yapfast_discord::ready::Server {
             id: "10".into(),
             text_channels: vec![yapfast_discord::ready::Channel {
                 id: "11".into(),
                 name: name.into(),
-                unread,
                 ..Default::default()
             }],
             ..Default::default()
+        };
+        Some(MarkedServer::marked(server, ServerMarks::default(), |_| {
+            ChannelMarks {
+                unread,
+                ..Default::default()
+            }
         }))
     };
     let rendering = |names: u64, server| Rendering {
         names,
         me: "1".into(),
-        blocked: vec![],
+        blocked: vec![].into(),
         server,
         may_pin: false,
         may_forward: false,
@@ -418,12 +424,16 @@ fn messages_render_again_once_what_they_show_changes() {
         !shown.alike(&rendering(1, server("chat", false))),
         "renamed"
     );
+    // This account's roles decide which mentions call on it.
+    let mut roles = shown.server.clone().unwrap();
+    Arc::make_mut(&mut roles.marks).roles = vec!["20".into()];
+    assert!(!shown.alike(&rendering(1, Some(roles))), "roles");
     assert!(
         !shown.alike(&rendering(2, server("general", false))),
         "names"
     );
     assert!(!shown.alike(&Rendering {
-        blocked: vec!["2".into()],
+        blocked: vec!["2".into()].into(),
         ..rendering(1, server("general", false))
     }));
     assert!(
@@ -547,6 +557,39 @@ fn a_busy_closed_channel_keeps_only_its_newest_messages() {
     let busy = channels.reopen("discord:10:11").unwrap();
     assert_eq!(ids(&busy), (51..=total).collect::<Vec<_>>());
     assert!(!busy.shown.complete, "the oldest went, so they load again");
+}
+
+#[test]
+fn a_busy_open_channel_lets_go_of_messages_well_above_the_view() {
+    let mut open = OpenChannel::new("discord:10:11").unwrap();
+    open.loaded(Load::Latest, shown(page([1, 2])));
+    let view = |open: &mut OpenChannel, from: u64, to: u64| {
+        open.visible((from..=to).map(|id| format!("d:{id}")).collect());
+    };
+    // The timeline follows its newest message, and says so as each comes.
+    let come = |open: &mut OpenChannel, ids: std::ops::RangeInclusive<u64>| {
+        for id in ids {
+            open.live(&Live::Created(message(&id.to_string(), None)));
+            open.let_go_above_view();
+        }
+    };
+    // Without a view, nothing is known to be off screen.
+    come(&mut open, 3..=400);
+    assert_eq!(open.shown.messages.len(), 400);
+    // Following the newest, it keeps the newest it keeps when closed.
+    view(&mut open, 390, 400);
+    come(&mut open, 401..=401);
+    assert_eq!(ids(&open), (202..=401).collect::<Vec<_>>());
+    assert!(!open.shown.complete, "the oldest went, so they load again");
+    come(&mut open, 402..=500);
+    assert_eq!(open.shown.messages.len(), 299, "not each time one comes");
+    // Those in view and some above them stay, wherever the view is.
+    view(&mut open, 220, 230);
+    come(&mut open, 501..=600);
+    assert_eq!(ids(&open).first(), Some(&202));
+    view(&mut open, 400, 410);
+    come(&mut open, 601..=601);
+    assert_eq!(ids(&open).first(), Some(&350));
 }
 
 #[test]
@@ -769,7 +812,11 @@ async fn earlier_history_loads_a_page_at_a_time_until_the_first_message() {
             &mut finished,
             &mut received,
             |event| match event {
-                Event::HistoryLoaded { history, .. } => Some(*history),
+                Event::HistoryLoaded {
+                    direction: Direction::Earlier,
+                    history,
+                    ..
+                } => Some(*history),
                 _ => None,
             },
         )
@@ -1235,8 +1282,14 @@ fn changing_the_view_drops_old_previews_and_ignores_late_downloads() {
     open.picture("preview".into(), Some(picture));
     assert!(open.pictures["preview"].is_some());
     open.rendered.insert(1, Arc::default());
+    open.rendered.insert(2, Arc::default());
     assert!(open.visible(vec!["d:2".into()]));
-    assert!(open.pictures.is_empty() && open.requested.is_empty() && open.rendered.is_empty());
+    assert!(open.pictures.is_empty() && open.requested.is_empty());
+    assert_eq!(
+        open.rendered.keys().collect::<Vec<_>>(),
+        [&2],
+        "a row without a preview shows the same anywhere"
+    );
     open.picture("preview".into(), Some(Arc::new(Picture::default())));
     assert!(
         open.pictures.is_empty(),

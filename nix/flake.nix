@@ -8,7 +8,7 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       native = import ./native.nix { inherit pkgs; };
-      inherit (native) webrtc skia skiaPackage libraries;
+      inherit (native) webrtc skia skiaPackage libraries runtimeLibraries;
       windowsWebrtcArchive = pkgs.fetchurl {
         url = "https://github.com/livekit/rust-sdks/releases/download/webrtc-51ef663/webrtc-win-x64-release.zip";
         hash = "sha256-ClalyRs7e0IiCCuKCTiNFqgCzeItZylb6yTFVwB1WzA=";
@@ -71,11 +71,13 @@
             protobuf curl jq docker-compose python3 llvmPackages_21.llvm
             # pasta, nftables and iproute2 isolate one voice test participant's network.
             passt nftables iproute2
-            # Runs testing/fake_discord.ts.
-            bun
+            # Runs testing/fake_discord.ts, and its tests side by side.
+            bun cargo-nextest
+            # Assembles x264's x86-64 code (vendor/x264-src).
+            nasm
           ];
           buildInputs = libraries;
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath libraries;
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibraries;
           CC = "clang";
           CXX = "clang++";
           PROTOC = "${pkgs.protobuf}/bin/protoc";
@@ -95,6 +97,8 @@
             xvfb-run
             llvmPackages_21.clang llvmPackages_21.lld llvmPackages_21.llvm
             llvmPackages_21.libclang
+            # Assembles x264's x86-64 code (vendor/x264-src).
+            nasm
           ];
           CC = "clang";
           CXX = "clang++";

@@ -45,6 +45,8 @@ rustPlatform.buildRustPackage {
   buildFeatures = [ "desktop" "discord" ];
   nativeBuildInputs = with pkgs; [
     pkg-config cmake llvmPackages_21.clang llvmPackages_21.llvm protobuf
+    # Assembles x264's x86-64 code (vendor/x264-src).
+    nasm
     # Skia's build script fetches its archive with curl, even from a file:// URL.
     curl makeWrapper rustPlatform.bindgenHook
   ];
@@ -75,7 +77,7 @@ rustPlatform.buildRustPackage {
     # The GPU, audio and screen capture libraries are loaded at runtime, and
     # NixOS keeps the GPU driver's in /run/opengl-driver.
     wrapProgram "$out/bin/yapfast" \
-      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath native.libraries} \
+      --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath native.runtimeLibraries} \
       --suffix LD_LIBRARY_PATH : /run/opengl-driver/lib
   '';
   meta = {

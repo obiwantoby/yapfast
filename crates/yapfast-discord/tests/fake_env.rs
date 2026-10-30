@@ -12,6 +12,7 @@ use yapfast_discord::{
     api::Span,
     client,
     member_list::Presence,
+    rtp::Codec,
     service::{Discord, Live, Snapshot, Status},
     stream,
     stream_connection::StreamReceiver,
@@ -131,13 +132,13 @@ async fn shows_the_example_environment() {
         .map(|channel| channel.name.as_str())
         .collect();
     assert_eq!(voice, ["Greenhouse", "Potting shed"]);
-    let general = &garden.text_channels[1];
+    let general = garden.text_channels().nth(1).unwrap();
     assert_eq!(
         general.topic.as_deref(),
         Some("Seeds, soil and everything green. Be kind.")
     );
-    assert!(general.unread && general.mentions == 1);
-    assert!(!garden.text_channels[2].unread);
+    assert!(general.marks.unread && general.marks.mentions == 1);
+    assert!(!garden.text_channels().nth(2).unwrap().marks.unread);
     let greenhouse = &garden.voice_channels[0];
     let seated: Vec<_> = snapshot.voice[&greenhouse.id]
         .iter()
@@ -291,7 +292,7 @@ async fn shows_the_example_environment() {
         .await
         .unwrap();
     let frames = tokio::task::spawn_blocking(move || {
-        let receiver = StreamReceiver::start(watched).unwrap();
+        let receiver = StreamReceiver::start(watched, vec![Codec::H264, Codec::Vp8]).unwrap();
         let deadline = std::time::Instant::now() + WAIT;
         let mut frames = vec![];
         while frames.len() < 12 {

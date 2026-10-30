@@ -179,6 +179,18 @@ pub struct FriendRequest {
     pub spam: bool,
 }
 
+/// Someone the Discord account blocked, as the blocked list shows them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Blocked {
+    /// Their Discord user id.
+    pub id: String,
+    pub name: String,
+    /// Their username, such as `ann`, when their name is a display name.
+    pub username: Option<String>,
+    /// The address of their avatar; see [`DiscordCommand::Pictures`].
+    pub avatar: Option<String>,
+}
+
 /// A Discord friend, as the friends list shows them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Friend {
@@ -325,27 +337,58 @@ pub fn file_size(bytes: u64) -> String {
     }
 }
 
-/// Makes `list` hold `items`, copying only those that differ from what it
-/// held there: comparing a long list costs less than copying it.
-pub fn sync_list<'a, T: Clone + PartialEq + 'a>(
-    list: &mut Vec<T>,
-    items: impl IntoIterator<Item = &'a T>,
-) {
+/// Makes `list` share `items`, keeping what it held at each place where the
+/// item there is the same one, or equal to it. Returns whether it changed.
+pub fn sync_list<'a, T: PartialEq + 'a>(
+    list: &mut Vec<Arc<T>>,
+    items: impl IntoIterator<Item = &'a Arc<T>>,
+) -> bool {
+    sync_with(
+        list,
+        items,
+        |held, item| Arc::ptr_eq(held, item) || **held == ***item,
+        Arc::clone,
+    )
+}
+
+/// [`sync_list`] for items made afresh: the list keeps what it held where
+/// that's equal to the new item, so whoever shares it goes on sharing it.
+pub fn share_list<T: PartialEq>(
+    list: &mut Vec<Arc<T>>,
+    items: impl IntoIterator<Item = T>,
+) -> bool {
+    sync_with(list, items, |held, item| **held == *item, Arc::new)
+}
+
+fn sync_with<T, I>(
+    list: &mut Vec<Arc<T>>,
+    items: impl IntoIterator<Item = I>,
+    same: impl Fn(&Arc<T>, &I) -> bool,
+    share: impl Fn(I) -> Arc<T>,
+) -> bool {
+    let mut changed = false;
     let mut count = 0;
     for item in items {
         match list.get_mut(count) {
-            Some(held) if held == item => {}
-            Some(held) => held.clone_from(item),
-            None => list.push(item.clone()),
+            Some(held) if same(held, &item) => {}
+            Some(held) => {
+                *held = share(item);
+                changed = true;
+            }
+            None => {
+                list.push(share(item));
+                changed = true;
+            }
         }
         count += 1;
     }
+    changed |= list.len() > count;
     list.truncate(count);
-    // Growing a room at a time can leave room for twice as many; a large
-    // account's room list takes megabytes.
+    // Growing a room at a time can leave room for twice as many.
     if list.capacity() > count + count / 4 {
         list.shrink_to_fit();
     }
+    changed
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -1511,6 +1554,9 @@ pub enum Direction {
     Later,
     /// [`Command::Around`].
     Around,
+    /// The newest page of a Discord channel, as it opens or loads again:
+    /// what shows of it by then is all there is.
+    Latest,
 }
 
 pub enum Start {
@@ -1721,10 +1767,13 @@ pub enum Command {
     /// ones, reusing those the backend kept where it can.
     Present(String),
     /// The timeline items in or near the viewport. Only their image previews
-    /// need decoding; metadata for other loaded items stays available.
+    /// need decoding; metadata for other loaded items stays available. While
+    /// the timeline follows its newest message, `at_end`, a busy one lets go
+    /// of its oldest; rows above go without moving it only then.
     VisibleMessages {
         room: String,
         items: Vec<String>,
+        at_end: bool,
     },
     Recover(String),
     RefreshTrust,
@@ -2117,10 +2166,16 @@ pub enum DiscordCommand {
         room: String,
         members: Vec<String>,
     },
-    /// Leave a Discord server, by its server id; [`Event::LeftServer`]
-    /// follows.
+    /// Leave a Discord server, by its server id; [`Event::Left`] follows.
     LeaveServer {
         server: String,
+    },
+    /// Leave a Discord group DM, by its room id, telling its other members
+    /// or not; [`Event::Left`] follows, and its CHANNEL_DELETE takes it out
+    /// of the DM list.
+    LeaveGroup {
+        room: String,
+        silent: bool,
     },
     /// Delete a Discord server this account owns, confirming with
     /// two-factor authentication if Discord asks; [`Event::ServerDeleted`]
@@ -2151,6 +2206,20 @@ pub enum DiscordCommand {
     /// Share the game the Discord account plays, or stop;
     /// [`Event::ShowGameSet`] follows.
     ShowGame(bool),
+    /// Set how loud the soundboard plays, as Discord keeps it, from 0 to
+    /// 100; [`Event::SoundboardVolumeSet`] follows.
+    SoundboardVolume(f32),
+    /// List every sound the account may join calls with;
+    /// [`Event::SoundCatalog`] follows.
+    SoundCatalog,
+    /// Set the sound that plays as the account joins a voice channel of
+    /// `server`, or of every server without one of its own, or take it
+    /// away; `sound` is its id and its own server's, none for Discord's
+    /// own. [`Event::JoinSoundSet`] follows.
+    SetJoinSound {
+        server: Option<String>,
+        sound: Option<(String, Option<String>)>,
+    },
     /// Nobody has used Yapfast since then, in Unix milliseconds, or someone is
     /// using it again; Discord goes AFK, and idle if `show_idle`, as its web
     /// client does.
@@ -3070,6 +3139,13 @@ pub enum Event {
     StatusSet(Result<(), String>),
     /// Whether [`DiscordCommand::ShowGame`] changed it, or why not.
     ShowGameSet(Result<(), String>),
+    /// Whether [`DiscordCommand::SoundboardVolume`] changed it, or why not.
+    SoundboardVolumeSet(Result<(), String>),
+    /// [`DiscordCommand::SoundCatalog`]'s sounds, in groups as the
+    /// soundboard shows them, or why they didn't come.
+    SoundCatalog(Result<Arc<[crate::voice::SoundGroup]>, String>),
+    /// Whether [`DiscordCommand::SetJoinSound`] changed it, or why not.
+    JoinSoundSet(Result<(), String>),
     /// [`DiscordCommand::Unlink`] forgot the account.
     DiscordUnlinked,
     /// [`DiscordCommand::Pins`]'s messages, the latest pinned first, or why
@@ -3312,10 +3388,10 @@ pub enum Event {
         query: String,
         members: Vec<RoleMember>,
     },
-    /// Whether this account left a Discord server, by its server id, or why
-    /// not.
-    LeftServer {
-        server: String,
+    /// Whether this account left a Discord server or group DM, by its
+    /// server or room id, or why not.
+    Left {
+        place: String,
         result: Result<(), String>,
     },
     /// Whether Discord deleted a server, or why not.
@@ -3402,8 +3478,8 @@ pub enum Event {
         message: String,
     },
     /// A page of history [`Command::Earlier`], [`Command::Later`] or
-    /// [`Command::Around`] asked for is in the room's timeline, or why
-    /// there's none.
+    /// [`Command::Around`] asked for, or a Discord channel's newest, is in
+    /// the room's timeline, or why there's none.
     HistoryLoaded {
         room: String,
         direction: Direction,
@@ -3871,7 +3947,7 @@ pub async fn run(
             return;
         }
     };
-    // Discord connects when this device has a linked account; see docs/discord.md.
+    // Discord connects when this device has a linked account; see docs/discord/README.md.
     // Why a linked account isn't running answers the commands that need it.
     #[cfg(feature = "discord")]
     let (mut discord, mut discord_error) = match crate::discord_text::Chat::start() {
@@ -4155,6 +4231,7 @@ mod tests {
                 Command::VisibleMessages {
                     room: matrix.clone(),
                     items: vec![],
+                    at_end: false,
                 },
                 Route::Matrix,
             ),
@@ -4162,6 +4239,7 @@ mod tests {
                 Command::VisibleMessages {
                     room: discord.clone(),
                     items: vec![],
+                    at_end: false,
                 },
                 Route::Discord,
             ),

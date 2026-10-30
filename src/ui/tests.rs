@@ -282,7 +282,7 @@ fn files_dropped_on_the_window_stage_or_say_why_not() {
 #[test]
 #[cfg(feature = "discord")]
 fn files_dropped_on_the_thread_beside_go_with_its_message() {
-    let (window, adapter, folder) = discord_server_window_changed(0, |server| {
+    let (window, adapter, folder) = discord_server_window_changed(0, |server, _| {
         server
             .threads
             .push(yapfast_core::yapfast_discord::ready::Channel {
@@ -661,6 +661,85 @@ fn says_how_long_a_game_has_run() {
     assert_eq!(games::played_for(5 * 60_000), "5 min");
     assert_eq!(games::played_for(120 * 60_000), "2 hr");
     assert_eq!(games::played_for(125 * 60_000), "2 hr 5 min");
+}
+
+#[test]
+fn a_chosen_device_that_went_away_shows_as_not_connected() {
+    let device = |id: &str, name: &str| voice::Device {
+        id: id.into(),
+        name: name.into(),
+    };
+    let mut names = HashMap::new();
+    let both = [
+        device("{speakers}", "Speakers"),
+        device("{headphones}", "Headphones"),
+    ];
+    let (rows, index) = device_rows(&both, Some("{headphones}"), &mut names);
+    assert_eq!(rows, ["Speakers", "Headphones"]);
+    assert_eq!(index, 1);
+    // They go away: still chosen, by the name they had, not another device.
+    let (rows, index) = device_rows(&both[..1], Some("{headphones}"), &mut names);
+    assert_eq!(rows, ["Speakers", "Headphones (not connected)"]);
+    assert_eq!(index, 1);
+    // A device known by its name, as on PulseAudio, has it in its id.
+    let (rows, index) = device_rows(&both[..1], Some("name:USB headset"), &mut HashMap::new());
+    assert_eq!(rows, ["Speakers", "USB headset (not connected)"]);
+    assert_eq!(index, 1);
+    // The default entry's id names the default it had; it stays the default.
+    let pulse = [
+        device("name:default: Headset", "default: Headset"),
+        device("name:Headset", "Headset"),
+        device("name:Built-in", "Built-in"),
+    ];
+    let (rows, index) = device_rows(&pulse, Some("name:default: Built-in"), &mut names);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(index, 0);
+    let (rows, index) = device_rows(&[], None, &mut names);
+    assert!(rows.is_empty());
+    assert_eq!(index, -1, "nothing to choose");
+    assert_eq!(
+        device_rows(&both, None, &mut names).1,
+        0,
+        "the default, listed first"
+    );
+}
+
+#[test]
+fn call_volumes_play_while_dragged_and_are_remembered() {
+    i_slint_backend_testing::init_no_event_loop();
+    let directory = tempfile::tempdir().unwrap();
+    let window = YapfastWindow::new().unwrap();
+    let adapter = Adapter::new(
+        Arc::new(BackgroundRuntime::new().unwrap()),
+        directory.path().into(),
+        &window,
+    )
+    .unwrap();
+    bind_callbacks(&window, &adapter);
+    assert_eq!(window.get_microphone_volume(), 100, "as it comes");
+    assert_eq!(window.get_speaker_volume(), 100);
+    window.set_microphone_volume(200);
+    window.set_speaker_volume(50);
+    window.invoke_call_volumes_changed();
+    assert!((yapfast_core::volume::microphone() - 1.995).abs() < 1e-3);
+    assert!((yapfast_core::volume::speakers() - 0.143).abs() < 1e-3);
+    assert_eq!(
+        Layout::read(directory.path()).microphone_volume,
+        None,
+        "a drag's steps aren't saved"
+    );
+    window.invoke_preferences_changed();
+    let read = Layout::read(directory.path());
+    assert_eq!(read.microphone_volume, Some(200));
+    assert_eq!(read.speaker_volume, Some(50));
+    let defaults: Layout = serde_json::from_str("{}").unwrap();
+    defaults.apply(&window);
+    assert_eq!(yapfast_core::volume::microphone(), 1.0);
+    assert_eq!(yapfast_core::volume::speakers(), 1.0);
+    read.apply(&window);
+    assert_eq!(window.get_microphone_volume(), 200);
+    assert_eq!(window.get_speaker_volume(), 50);
+    defaults.apply(&window);
 }
 
 #[test]
@@ -1793,6 +1872,46 @@ fn forwarding_and_frequent_reactions_reach_the_window() {
 }
 
 #[test]
+fn the_quick_switcher_reaches_the_window() {
+    i_slint_backend_testing::init_no_event_loop();
+    let directory = tempfile::tempdir().unwrap();
+    let window = YapfastWindow::new().unwrap();
+    let adapter = Adapter::new(
+        Arc::new(BackgroundRuntime::new().unwrap()),
+        directory.path().into(),
+        &window,
+    )
+    .unwrap();
+    bind_callbacks(&window, &adapter);
+    window.invoke_explore_preview();
+    // Ctrl+K, which the native window's events carry.
+    adapter.borrow_mut().action(&window, Action::ToggleSwitcher);
+    assert!(window.get_switcher_open());
+    assert_eq!(window.get_switcher_query(), "");
+    window.invoke_switcher_search("gam".into());
+    let places = window.get_switcher_places();
+    let games = places.iter().find(|place| place.id == "games").unwrap();
+    assert!(!games.avatar, "a channel shows its own icon");
+    assert_eq!(games.place, "Friends");
+    window.invoke_switcher_search("*fri".into());
+    let places = window.get_switcher_places();
+    assert_eq!(places.row_count(), 1);
+    let server = places.row_data(0).unwrap();
+    assert_eq!((server.name.as_str(), server.avatar), ("Friends", true));
+    window.invoke_switch_to("games".into());
+    assert!(!window.get_switcher_open());
+    assert_eq!(
+        adapter.borrow().app.state.selected.as_deref(),
+        Some("games")
+    );
+    // Opened again, it starts afresh.
+    adapter.borrow_mut().action(&window, Action::ToggleSwitcher);
+    assert_eq!(window.get_switcher_query(), "");
+    window.invoke_close_switcher();
+    assert!(!window.get_switcher_open());
+}
+
+#[test]
 fn scrolling_up_leaves_the_latest_message() {
     i_slint_backend_testing::init_no_event_loop();
     let window = YapfastWindow::new().unwrap();
@@ -2406,9 +2525,11 @@ fn signed_in_controls_keep_trust_and_plaintext_sending_gates() {
             .state
             .rooms
             .iter_mut()
+            .map(Arc::make_mut)
             .find(|room| room.id == id)
             .unwrap()
             .encrypted = false;
+        adapter.app.state.list_changes += 1;
         adapter.refresh(&window);
     }
     assert!(!window.get_composer_enabled() && !window.get_can_send());
@@ -2513,7 +2634,8 @@ fn typing_and_the_call_show_without_building_the_rest_again() {
     adapter.models.rooms.set_row_data(0, row);
     adapter.refresh(&window);
     assert_eq!(adapter.models.rooms.row_data(0).unwrap().name, "Marked");
-    adapter.app.state.rooms[0].name = "Renamed".into();
+    Arc::make_mut(&mut adapter.app.state.rooms[0]).name = "Renamed".into();
+    adapter.app.state.list_changes += 1;
     adapter.refresh(&window);
     assert_ne!(adapter.models.rooms.row_data(0).unwrap().name, "Marked");
 }
@@ -2977,10 +3099,12 @@ fn an_unread_dm_shows_on_the_rail_above_the_servers_and_opens() {
             .state
             .rooms
             .iter_mut()
+            .map(Arc::make_mut)
             .find(|room| room.id == "riley")
             .unwrap();
         riley.unread = 2;
         riley.mentions = 2;
+        adapter.app.state.list_changes += 1;
         adapter.refresh(&window);
     }
     let unread = rail(&window);
@@ -3018,12 +3142,14 @@ fn a_folder_on_the_rail_holds_its_servers_until_opened() {
         }
     };
     let mut state = AppState::default();
-    state.servers = vec![
+    state.servers = [
         server("Alpha", None),
         server("Bravo", Some(&folder)),
         server("Charlie", Some(&folder)),
         server("Delta", None),
-    ];
+    ]
+    .map(Arc::new)
+    .into();
     state.navigation = Navigation::Server("Charlie".into());
     let shown = |open: &[&str]| {
         let open = open.iter().map(|&id| id.to_owned()).collect();
@@ -3204,13 +3330,15 @@ fn friends_in_a_servers_voice_channel_show_where() {
         preview: None,
     };
     let mut state = AppState::default();
-    state.rooms = vec![
+    state.rooms = [
         room("lounge", true, false, vec![person("ann"), person("bob")]),
         room("general", false, false, Vec::new()),
         // A DM call isn't a server's voice channel.
         room("dm", true, true, vec![person("cat")]),
-    ];
-    state.servers = vec![ChatServer {
+    ]
+    .map(Arc::new)
+    .into();
+    state.servers = vec![Arc::new(ChatServer {
         id: "Alpha".into(),
         name: "Alpha".into(),
         channels: vec!["lounge".into(), "general".into()],
@@ -3222,11 +3350,11 @@ fn friends_in_a_servers_voice_channel_show_where() {
         hide_muted: false,
         community: false,
         pinned: Vec::new(),
-    }];
+    })];
     let rooms_by_id = state
         .rooms
         .iter()
-        .map(|room| (room.id.as_str(), room))
+        .map(|room| (room.id.as_str(), &**room))
         .collect();
     let places = refresh::voice_places(&state, &rooms_by_id);
     let mut found: Vec<_> = places
@@ -3266,10 +3394,12 @@ fn a_call_shows_on_its_servers_icon_and_its_closed_folder() {
         }
     };
     let mut state = AppState::default();
-    state.servers = vec![
+    state.servers = [
         server("Alpha", "alpha-lounge", None),
         server("Bravo", "bravo-lounge", Some(&folder)),
-    ];
+    ]
+    .map(Arc::new)
+    .into();
     let calls = |state: &AppState, open: &[&str]| -> Vec<(String, bool)> {
         let open = open.iter().map(|&id| id.to_owned()).collect();
         refresh::rail_rows(state, &HashMap::new(), &open)
@@ -3397,6 +3527,7 @@ fn discord_server_adapter(
     directory: &std::path::Path,
 ) -> Rc<RefCell<Adapter>> {
     use yapfast_discord::{
+        marked::{ChannelMarks, MarkedServer, ServerMarks},
         notifications::{Level, Mute, Notifications as Settings, Override},
         ready,
         service::{Snapshot, Status},
@@ -3408,7 +3539,7 @@ fn discord_server_adapter(
     )
     .unwrap();
     bind_callbacks(window, &adapter);
-    let mut server = ready::server(&serde_json::json!({
+    let server = ready::server(&serde_json::json!({
         "id": "10", "owner_id": "99",
         "properties": {"name": "Test", "default_message_notifications": 1},
         "roles": [{"id": "10", "name": "@everyone", "position": 0, "permissions": "3072"}],
@@ -3419,7 +3550,7 @@ fn discord_server_adapter(
         ],
     }))
     .unwrap();
-    server.notifications = Arc::new(Settings {
+    let notifications = Arc::new(Settings {
         overrides: [(
             "12".to_owned(),
             Override {
@@ -3434,14 +3565,25 @@ fn discord_server_adapter(
         .into(),
         ..Default::default()
     });
-    server.text_channels[1].muted = true;
+    let muted = server.text_channels[1].id.clone();
+    let server = MarkedServer::marked(
+        server,
+        ServerMarks {
+            notifications,
+            ..Default::default()
+        },
+        |channel| ChannelMarks {
+            muted: channel.id == muted,
+            ..Default::default()
+        },
+    );
     adapter
         .borrow_mut()
         .app
         .apply(yapfast_core::chat::Event::Discord(Arc::new(Snapshot {
             status: Status::Online,
             user_id: Some("1".into()),
-            servers: vec![Arc::new(server)],
+            servers: vec![server],
             ..Default::default()
         })));
     adapter
@@ -3615,16 +3757,20 @@ fn discord_server_window() -> (YapfastWindow, Rc<RefCell<Adapter>>, tempfile::Te
 fn discord_server_window_granting(
     extra: u64,
 ) -> (YapfastWindow, Rc<RefCell<Adapter>>, tempfile::TempDir) {
-    discord_server_window_changed(extra, |_| {})
+    discord_server_window_changed(extra, |_, _| {})
 }
 
 /// [`discord_server_window_granting`], with `change` made to the server.
 #[cfg(feature = "discord")]
 fn discord_server_window_changed(
     extra: u64,
-    change: impl FnOnce(&mut yapfast_core::yapfast_discord::ready::Server),
+    change: impl FnOnce(
+        &mut yapfast_core::yapfast_discord::ready::Server,
+        &mut yapfast_core::yapfast_discord::marked::ServerMarks,
+    ),
 ) -> (YapfastWindow, Rc<RefCell<Adapter>>, tempfile::TempDir) {
     use yapfast_core::yapfast_discord::{
+        marked::{MarkedServer, ServerMarks},
         notifications::Notifications,
         ready::{self, permission},
         service::{Snapshot, Status},
@@ -3656,20 +3802,27 @@ fn discord_server_window_changed(
         ],
     }))
     .unwrap();
-    server.notifications = Arc::new(Notifications {
-        hide_muted_channels: true,
-        suppress_roles: true,
+    let mut marks = ServerMarks {
+        notifications: Arc::new(Notifications {
+            hide_muted_channels: true,
+            suppress_roles: true,
+            ..Default::default()
+        }),
         ..Default::default()
-    });
-    server.text_channels[0].mentions = 1;
-    change(&mut server);
+    };
+    let general = server.text_channels[0].id.clone();
+    marks.channel_mut(&server, &general).unwrap().mentions = 1;
+    change(&mut server, &mut marks);
     adapter
         .borrow_mut()
         .app
         .apply(Event::Discord(Arc::new(Snapshot {
             status: Status::Online,
             user_id: Some("1".into()),
-            servers: vec![Arc::new(server)],
+            servers: vec![MarkedServer {
+                server: Arc::new(server),
+                marks: Arc::new(marks),
+            }],
             ..Default::default()
         })));
     (window, adapter, directory)
@@ -3813,7 +3966,7 @@ fn discord_categories_head_their_channels_and_open_their_menus() {
 #[test]
 #[cfg(feature = "discord")]
 fn categories_of_the_same_name_head_and_fold_their_own_channels() {
-    let (window, adapter, _directory) = discord_server_window_changed(0, |server| {
+    let (window, adapter, _directory) = discord_server_window_changed(0, |server, _| {
         Arc::make_mut(&mut server.categories)
             .get_mut("5")
             .unwrap()
@@ -3847,8 +4000,8 @@ fn categories_of_the_same_name_head_and_fold_their_own_channels() {
 #[cfg(feature = "discord")]
 fn pinned_channels_leave_their_categories_for_the_top() {
     use yapfast_core::yapfast_discord::notifications::{Notifications, Override};
-    let (window, adapter, _directory) = discord_server_window_changed(0, |server| {
-        let mut settings = Notifications::clone(&server.notifications);
+    let (window, adapter, _directory) = discord_server_window_changed(0, |_, marks| {
+        let mut settings = Notifications::clone(&marks.notifications);
         settings.overrides.insert(
             "11".into(),
             Override {
@@ -3856,7 +4009,7 @@ fn pinned_channels_leave_their_categories_for_the_top() {
                 ..Default::default()
             },
         );
-        server.notifications = Arc::new(settings);
+        marks.notifications = Arc::new(settings);
     });
     {
         // A category of that name folding doesn't fold the pinned ones.
@@ -3912,13 +4065,14 @@ fn pinned_channels_leave_their_categories_for_the_top() {
 #[cfg(feature = "discord")]
 fn a_community_server_lists_the_channels_followed_and_offers_following() {
     use yapfast_core::yapfast_discord::notifications::Notifications;
-    let (window, adapter, _directory) = discord_server_window_changed(0, |server| {
-        let mut settings = Notifications::clone(&server.notifications);
+    let (window, adapter, _directory) = discord_server_window_changed(0, |server, marks| {
+        let mut settings = Notifications::clone(&marks.notifications);
         settings.flags = 1 << 14;
-        server.notifications = Arc::new(settings);
+        marks.notifications = Arc::new(settings);
         server.community = true;
-        server.text_channels[0].mentions = 0;
-        server.text_channels[0].unread = true;
+        let general = marks.channel_mut(server, "11").unwrap();
+        general.mentions = 0;
+        general.unread = true;
     });
     window.invoke_navigate_server("discord:10".into());
     let rail = window.get_servers();
@@ -3970,7 +4124,7 @@ fn a_community_server_lists_the_channels_followed_and_offers_following() {
 #[test]
 #[cfg(feature = "discord")]
 fn browse_channels_opens_from_a_community_servers_list_and_searches() {
-    let (window, _adapter, _directory) = discord_server_window_changed(0, |server| {
+    let (window, _adapter, _directory) = discord_server_window_changed(0, |server, _| {
         server.community = true;
         server.text_channels[0].topic = Some("Say **hi**".into());
     });
@@ -4316,10 +4470,54 @@ fn leaving_a_server_asks_first_in_red() {
     assert_eq!(prompt.title, "Leave 'Test'");
     assert_eq!(prompt.confirm, "Leave server");
     assert!(prompt.danger && !prompt.named && !prompt.saving);
-    window.invoke_leave_server();
+    window.invoke_confirm_leave();
     assert!(adapter.borrow().app.state.leave.as_ref().unwrap().leaving);
     window.invoke_close_leave();
     assert!(!window.get_leave_open());
+}
+
+#[test]
+#[cfg(feature = "discord")]
+fn leaving_a_group_dm_asks_first_and_offers_to_tell_no_one() {
+    use yapfast_core::yapfast_discord::service::{Conversation, Snapshot, Status};
+    let (window, adapter, _directory) = discord_server_window();
+    adapter
+        .borrow_mut()
+        .app
+        .apply(Event::Discord(Arc::new(Snapshot {
+            status: Status::Online,
+            user_id: Some("1".into()),
+            conversations: vec![Arc::new(Conversation {
+                id: "31".into(),
+                name: "Hikers".into(),
+                group: true,
+                people: 3,
+                ..Default::default()
+            })],
+            ..Default::default()
+        })));
+    let group = "discord:@me:31";
+    window.invoke_prepare_menu(group.into(), false);
+    let rows = window.get_menu_rows();
+    let leave = rows.iter().find(|row| row.text == "Leave group").unwrap();
+    assert!(leave.danger && leave.separated);
+    window.invoke_choose_menu(group.into(), false, "leave-group".into());
+    assert!(window.get_leave_open());
+    let prompt = window.get_leave_prompt();
+    assert_eq!(prompt.title, "Leave 'Hikers'");
+    assert_eq!(
+        prompt.detail,
+        "Are you sure you want to leave Hikers? You won't be able to rejoin this group unless you are re-invited."
+    );
+    assert_eq!(prompt.confirm, "Leave group");
+    assert_eq!(prompt.option, "Leave without notifying other members");
+    assert!(prompt.danger && !prompt.ticked);
+    window.invoke_toggle_silent_leave();
+    assert!(window.get_leave_prompt().ticked);
+    window.invoke_confirm_leave();
+    let leave = adapter.borrow().app.state.leave.clone().unwrap();
+    assert!(leave.leaving && leave.silent);
+    assert!(window.get_leave_prompt().saving);
 }
 
 #[test]
@@ -4781,7 +4979,7 @@ fn members_and_invites_list_as_discords_pages_do() {
     };
     let (window, adapter, _directory) = discord_server_window_changed(
         permission::KICK_MEMBERS | permission::MANAGE_GUILD | permission::CREATE_INSTANT_INVITE,
-        |server| {
+        |server, _| {
             server.put_role(
                 &serde_json::json!({"id": "20", "name": "Mods", "position": 2,
                                                 "color": 0x3498db, "permissions": "0"}),
@@ -4953,7 +5151,7 @@ fn members_and_invites_list_as_discords_pages_do() {
 #[test]
 fn delete_server_ends_the_owners_sidebar_and_asks_for_the_name() {
     use slint::Model;
-    let (window, _adapter, _directory) = discord_server_window_changed(0, |server| {
+    let (window, _adapter, _directory) = discord_server_window_changed(0, |server, _| {
         server.owner_id = Some("1".into());
     });
     window.invoke_prepare_menu("header:discord:10".into(), false);
@@ -4993,7 +5191,7 @@ fn emoji_and_stickers_show_as_discords_pages_do() {
         yapfast_discord::ready::permission,
     };
     let (window, adapter, _directory) =
-        discord_server_window_changed(permission::CREATE_GUILD_EXPRESSIONS, |_| {});
+        discord_server_window_changed(permission::CREATE_GUILD_EXPRESSIONS, |_, _| {});
     window.invoke_prepare_menu("header:discord:10".into(), false);
     window.invoke_choose_menu("header:discord:10".into(), false, "server-settings".into());
     let rows: Vec<String> = window
@@ -5134,8 +5332,8 @@ fn roles_lock_what_ranks_above_her_and_the_permissions_she_lacks() {
     };
     // She holds Staff, which may kick.
     let (window, adapter, _directory) =
-        discord_server_window_changed(permission::MANAGE_ROLES, |server| {
-            server.my_roles = vec!["20".into()];
+        discord_server_window_changed(permission::MANAGE_ROLES, |server, marks| {
+            marks.roles = vec!["20".into()];
             Arc::make_mut(&mut server.role_positions).insert("20".into(), 2);
             Arc::make_mut(&mut server.roles).insert("20".into(), permission::KICK_MEMBERS);
         });
@@ -5984,5 +6182,196 @@ fn a_card_of_components_shows_headings_files_and_only_link_buttons_working() {
 fn headings_in_fenced_code_stay_as_typed() {
     let blocks = text_blocks("```\n# not a heading\n```\n## Two");
     let levels: Vec<_> = blocks.iter().map(|block| block.level).collect();
-    assert_eq!(levels, [0, 2]);
+    assert_eq!(levels, [5, 2]);
+    assert_eq!(
+        i_slint_core::yapfast_selection::plain(&blocks[0].text),
+        "# not a heading"
+    );
+}
+
+fn formatted(body: &str) -> ChatMessage {
+    ChatMessage {
+        item: "d:1".into(),
+        body: body.into(),
+        formatted: true,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn a_message_shows_its_headings_quotes_and_code_apart() {
+    i_slint_backend_testing::init_no_event_loop();
+    let row = message_row_plain(&formatted(
+        "# Title\n> quoted **bold**\n> -# small\n```\n<b>code</b>\n```\n-# end",
+    ));
+    let blocks: Vec<_> = row.blocks.iter().collect();
+    let shown: Vec<_> = blocks
+        .iter()
+        .map(|block| {
+            (
+                block.level,
+                block.quoted,
+                i_slint_core::yapfast_selection::plain(&block.text),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            (1, false, "Title".into()),
+            (0, true, "quoted bold".into()),
+            (4, true, "small".into()),
+            (5, false, "<b>code</b>".into()),
+            (4, false, "end".into()),
+        ]
+    );
+    // The quote's bar runs from its first block to its last.
+    assert!(blocks[1].quote_start && !blocks[1].quote_end);
+    assert!(!blocks[2].quote_start && blocks[2].quote_end);
+    // A first heading sits closer to the top than a later one would.
+    assert_eq!((blocks[0].margin, blocks[0].padding), (8.0, 0.0));
+    assert_eq!((blocks[1].margin, blocks[1].padding), (8.0, 0.0));
+    assert_eq!(blocks[3].margin, 6.0);
+    let text = message_text(&MessageRow {
+        first: false,
+        ..row
+    });
+    assert_eq!(text, "Title\nquoted bold\nsmall\n<b>code</b>\nend");
+}
+
+#[test]
+fn text_alone_shows_as_one() {
+    i_slint_backend_testing::init_no_event_loop();
+    let row = message_row_plain(&formatted("plain **text**\n- and a list"));
+    assert_eq!(row.blocks.row_count(), 0);
+    assert!(i_slint_core::yapfast_selection::plain(&row.styled).starts_with("plain text\n"));
+}
+
+#[test]
+fn text_beside_a_heading_keeps_its_formatting_and_blank_lines() {
+    i_slint_backend_testing::init_no_event_loop();
+    let row = message_row_plain(&formatted("# Title\n\n**bold**\n---"));
+    let plain: Vec<_> = row
+        .blocks
+        .iter()
+        .map(|block| i_slint_core::yapfast_selection::plain(&block.text))
+        .collect();
+    assert_eq!(plain, ["Title", "\u{a0}\nbold\n---"]);
+}
+
+#[test]
+fn html_in_a_block_shows_as_typed() {
+    i_slint_backend_testing::init_no_event_loop();
+    // Markdown would make the text after the open fence code, which the
+    // HTML's escaping skips, but Discord's client shows it as text.
+    let body = "```\n# Title\n<font color=\"#ff0000\">red</font>";
+    let row = message_row_plain(&formatted(body));
+    let last = row.blocks.iter().last().unwrap();
+    assert_eq!(
+        i_slint_core::yapfast_selection::plain(&last.text),
+        "<font color=\"#ff0000\">red</font>"
+    );
+}
+
+#[test]
+fn a_mention_in_a_quote_still_links() {
+    i_slint_backend_testing::init_no_event_loop();
+    let mut message = formatted("# Hi\n> and @Bob");
+    let plain = message_row_plain(&message);
+    message.mentions = vec![yapfast_core::mention::Mentioned {
+        text: "@Bob".into(),
+        target: yapfast_core::mention::Target::User("2".into()),
+        color: None,
+        at: vec![message.body.find('@').unwrap()],
+    }];
+    let mentioned = message_row_plain(&message);
+    let quote = |row: &MessageRow| row.blocks.row_data(1).unwrap().text;
+    assert!(quote(&plain) != quote(&mentioned));
+    assert_eq!(
+        i_slint_core::yapfast_selection::plain(&quote(&mentioned)),
+        "and @Bob"
+    );
+}
+
+#[test]
+fn spoilers_count_on_across_blocks() {
+    i_slint_backend_testing::init_no_event_loop();
+    let message = ChatMessage {
+        spoilers: true,
+        ..formatted("||a||\n# T ||b||")
+    };
+    let row = |revealed: &[&str]| {
+        let revealed = revealed.iter().map(|item| item.to_string()).collect();
+        let row = message_row(&message, &revealed);
+        let blocks: Vec<_> = row.blocks.iter().map(|block| block.text).collect();
+        blocks
+    };
+    let hidden = row(&[]);
+    let second = row(&["d:1/1"]);
+    assert!(hidden[0] == second[0], "the first is still hidden");
+    assert!(hidden[1] != second[1], "the heading's is the second");
+}
+
+#[test]
+fn an_embed_shows_headings_and_code_in_its_description_and_fields() {
+    i_slint_backend_testing::init_no_event_loop();
+    let message = ChatMessage {
+        embeds: vec![yapfast_core::chat::Embed {
+            description: "## Status\n```\nall good\n```".into(),
+            fields: vec![
+                yapfast_core::chat::EmbedField {
+                    name: "Plain".into(),
+                    value: "just **text**".into(),
+                    inline: false,
+                },
+                yapfast_core::chat::EmbedField {
+                    name: "Quoted".into(),
+                    value: "> said".into(),
+                    inline: false,
+                },
+            ],
+            ..Default::default()
+        }],
+        ..formatted("")
+    };
+    let row = message_row_plain(&message);
+    let embed = row.embeds.row_data(0).unwrap();
+    let levels: Vec<_> = embed
+        .description_blocks
+        .iter()
+        .map(|block| block.level)
+        .collect();
+    assert_eq!(levels, [2, 5]);
+    let fields: Vec<_> = embed
+        .field_rows
+        .iter()
+        .flat_map(|row| row.fields.iter().collect::<Vec<_>>())
+        .collect();
+    assert_eq!(fields[0].value_blocks.row_count(), 0);
+    assert_eq!(
+        i_slint_core::yapfast_selection::plain(&fields[0].value),
+        "just text"
+    );
+    assert!(fields[1].value_blocks.row_data(0).unwrap().quoted);
+    let text = message_text(&MessageRow {
+        first: false,
+        ..row
+    });
+    assert_eq!(text, "Status\nall good\nPlain\njust text\nQuoted\nsaid");
+}
+
+#[test]
+fn a_found_message_shows_its_blocks_with_spoilers_hidden() {
+    i_slint_backend_testing::init_no_event_loop();
+    let message = ChatMessage {
+        spoilers: true,
+        ..formatted("# Plans\n> meet at ||the park||")
+    };
+    let row = found_row(&message, false);
+    let plain: Vec<_> = row
+        .blocks
+        .iter()
+        .map(|block| i_slint_core::yapfast_selection::plain(&block.text))
+        .collect();
+    assert_eq!(plain, ["Plans", "meet at (spoiler)"]);
 }

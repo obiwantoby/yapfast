@@ -291,6 +291,81 @@ pub(super) fn command(
         }
         return None;
     }
+    if let Command::Discord(DiscordCommand::SoundboardVolume(volume)) = command {
+        match discord {
+            Ok(discord) => {
+                let (discord, events) = (discord.clone(), events.clone());
+                tokio::spawn(async move {
+                    let result = discord
+                        .set_soundboard_volume(volume)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                error = format!("{error:#}"),
+                                "could not change the soundboard volume"
+                            );
+                            error.to_string()
+                        });
+                    let _ = events.send(Event::SoundboardVolumeSet(result));
+                });
+            }
+            Err(why) => {
+                let _ = events.send(Event::SoundboardVolumeSet(Err(why.into())));
+            }
+        }
+        return None;
+    }
+    if let Command::Discord(DiscordCommand::SoundCatalog) = command {
+        match discord {
+            Ok(discord) => {
+                let (discord, events) = (discord.clone(), events.clone());
+                tokio::spawn(async move {
+                    let result = match crate::soundboard::Catalog::load(&discord).await {
+                        Ok(catalog) => Ok(catalog.groups(&discord.snapshots().borrow()).into()),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = format!("{error:#}"),
+                                "could not list the soundboard's sounds"
+                            );
+                            Err(error.to_string())
+                        }
+                    };
+                    let _ = events.send(Event::SoundCatalog(result));
+                });
+            }
+            Err(why) => {
+                let _ = events.send(Event::SoundCatalog(Err(why.into())));
+            }
+        }
+        return None;
+    }
+    if let Command::Discord(DiscordCommand::SetJoinSound { server, sound }) = command {
+        match discord {
+            Ok(discord) => {
+                let (discord, events) = (discord.clone(), events.clone());
+                tokio::spawn(async move {
+                    let sound = sound
+                        .as_ref()
+                        .map(|(id, guild)| (id.as_str(), guild.as_deref()));
+                    let result = discord
+                        .set_join_sound(server.as_deref(), sound)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                error = format!("{error:#}"),
+                                "could not change the join sound"
+                            );
+                            error.to_string()
+                        });
+                    let _ = events.send(Event::JoinSoundSet(result));
+                });
+            }
+            Err(why) => {
+                let _ = events.send(Event::JoinSoundSet(Err(why.into())));
+            }
+        }
+        return None;
+    }
     if let Command::Discord(DiscordCommand::ShowGame(shown)) = command {
         match discord {
             Ok(discord) => {
@@ -440,7 +515,13 @@ pub(super) fn command(
                                     page.threads
                                         .iter()
                                         .filter_map(|thread| {
-                                            discord::listed_thread(server, &names, thread)
+                                            // A page's threads have no marks.
+                                            discord::listed_thread(
+                                                server,
+                                                &names,
+                                                thread,
+                                                Default::default(),
+                                            )
                                         })
                                         .collect()
                                 })
@@ -893,26 +974,11 @@ pub(super) fn command(
         }
         return None;
     }
-    if let Command::Discord(DiscordCommand::LeaveServer { server }) = command {
-        let guild = discord::parse_server(&server).map(str::to_owned);
-        match (discord, guild) {
-            (Ok(discord), Some(guild)) => {
-                let (discord, events) = (discord.clone(), events.clone());
-                tokio::spawn(async move {
-                    let result = discord.leave_server(&guild).await.map_err(|error| {
-                        tracing::warn!(error = format!("{error:#}"), "could not leave a server");
-                        format!("Couldn't leave the server: {error}")
-                    });
-                    let _ = events.send(Event::LeftServer { server, result });
-                });
-            }
-            (discord, _) => {
-                let _ = events.send(Event::LeftServer {
-                    server,
-                    result: Err(discord.err().unwrap_or(NOT_DISCORD).into()),
-                });
-            }
-        }
+    if let Command::Discord(
+        command @ (DiscordCommand::LeaveServer { .. } | DiscordCommand::LeaveGroup { .. }),
+    ) = command
+    {
+        leave(command, discord, events);
         return None;
     }
     if let Command::Discord(
@@ -963,6 +1029,49 @@ fn from_dialog(change: &MemberChange) -> bool {
 
 /// Carries out a choice from a Discord server's, category's or channel's
 /// menu that makes, reads, changes or deletes a channel, and says how it went.
+/// Leaves a Discord server or group DM, answering with [`Event::Left`].
+fn leave(
+    command: DiscordCommand,
+    discord: Result<&Discord, &str>,
+    events: &UnboundedSender<Event>,
+) {
+    let (place, target) = match command {
+        DiscordCommand::LeaveServer { server } => {
+            let guild = discord::parse_server(&server).map(str::to_owned);
+            (server, guild.map(|guild| (guild, None)))
+        }
+        DiscordCommand::LeaveGroup { room, silent } => {
+            let channel = discord::parse_room(&room)
+                .filter(|(guild, _)| *guild == discord::DM_GUILD)
+                .map(|(_, channel)| channel.to_owned());
+            (room, channel.map(|channel| (channel, Some(silent))))
+        }
+        _ => return,
+    };
+    let (discord, (id, silent)) = match (discord, target) {
+        (Ok(discord), Some(target)) => (discord.clone(), target),
+        (discord, _) => {
+            let _ = events.send(Event::Left {
+                place,
+                result: Err(discord.err().unwrap_or(NOT_DISCORD).into()),
+            });
+            return;
+        }
+    };
+    let events = events.clone();
+    tokio::spawn(async move {
+        let (result, what) = match silent {
+            None => (discord.leave_server(&id).await, "server"),
+            Some(silent) => (discord.leave_group(&id, silent).await, "group"),
+        };
+        let result = result.map_err(|error| {
+            tracing::warn!(error = format!("{error:#}"), what, "could not leave");
+            format!("Couldn't leave the {what}: {error}")
+        });
+        let _ = events.send(Event::Left { place, result });
+    });
+}
+
 fn manage_channel(
     command: DiscordCommand,
     discord: Result<&Discord, &str>,

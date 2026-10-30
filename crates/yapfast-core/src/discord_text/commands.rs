@@ -223,8 +223,9 @@ pub fn command(
         return;
     };
     match command {
-        Command::VisibleMessages { items, .. } => {
-            if channel.visible(items) {
+        Command::VisibleMessages { items, at_end, .. } => {
+            let moved = channel.visible(items);
+            if (at_end && channel.let_go_above_view()) || moved {
                 publish(channel, discord, done, events);
             }
         }
@@ -469,10 +470,10 @@ pub fn finished(
             channel,
         ) => {
             let mut direction = match load {
-                Load::Latest => None,
-                Load::Earlier => Some(Direction::Earlier),
-                Load::Later => Some(Direction::Later),
-                Load::Around(_) => Some(Direction::Around),
+                Load::Latest => Direction::Latest,
+                Load::Earlier => Direction::Earlier,
+                Load::Later => Direction::Later,
+                Load::Around(_) => Direction::Around,
             };
             let history = match (result, channel) {
                 // Asked for before what shows was replaced; it's dropped.
@@ -486,7 +487,7 @@ pub fn finished(
                     // The latest page reached the window, which shows with
                     // the newest messages now, as when a later page does.
                     if detached && !channel.detached() && load == Load::Latest {
-                        direction = Some(Direction::Later);
+                        direction = Direction::Later;
                     }
                     Some(channel.history())
                 }
@@ -511,9 +512,7 @@ pub fn finished(
                     Some(History::Failed)
                 }
             };
-            history_loaded = direction
-                .zip(history)
-                .map(|(direction, history)| (room, direction, history));
+            history_loaded = history.map(|history| (room, direction, history));
         }
         (_, None) => {}
         (Done::Sent { nonce, result, .. }, Some(channel)) => {

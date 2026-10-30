@@ -1,7 +1,7 @@
 //! Builds the Go Live codec shims, the GIF thumbnail encoder, the video file
-//! reader and the cameras against the libvpx, OpenH264, FFmpeg, dav1d,
-//! libyuv and WebRTC headers in the same libwebrtc archive webrtc-sys links,
-//! so they match its code.
+//! reader and the cameras against the libvpx, FFmpeg, dav1d, libyuv and
+//! WebRTC headers in the same libwebrtc archive webrtc-sys links, so they
+//! match its code, and the H264 encoder against x264 (vendor/x264-src).
 
 fn main() {
     for file in [
@@ -12,6 +12,8 @@ fn main() {
         "video.c",
         "picture.c",
         "camera.cc",
+        "hwenc.c",
+        "hevc.c",
         "coreaudio.c",
         // The Mac's H264 decoder.
         "videotoolbox.c",
@@ -70,8 +72,32 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=oleaut32");
         }
     }
+    println!("cargo::rustc-check-cfg=cfg(hwenc)");
+    println!("cargo::rustc-check-cfg=cfg(hevcdec)");
     if std::env::var_os("CARGO_FEATURE_DISCORD").is_none() {
         return;
+    }
+    // FFmpeg's hardware encoders and HEVC decoder, where ffmpeg-src builds
+    // them: hwenc.c and hevc.c see only their headers, with FFmpeg's names
+    // prefixed as in the library.
+    if std::env::var("DEP_FFMPEG_ENCODERS").as_deref() == Ok("1") {
+        let mut ffmpeg = cc::Build::new();
+        ffmpeg
+            .file("native/hwenc.c")
+            .file("native/hevc.c")
+            .warnings(true);
+        let folders = std::env::var_os("DEP_FFMPEG_INCLUDE").expect("ffmpeg-src's headers");
+        ffmpeg.includes(std::env::split_paths(&folders));
+        let rename = std::env::var("DEP_FFMPEG_RENAME").expect("ffmpeg-src's renames");
+        // clang-cl, for Windows, spells the flags as MSVC does.
+        if ffmpeg.get_compiler().is_like_msvc() {
+            ffmpeg.flag("/std:c17").flag(format!("/FI{rename}"));
+        } else {
+            ffmpeg.flag("-std=c17").flag("-include").flag(&rename);
+        }
+        ffmpeg.compile("yapfast_hwenc");
+        println!("cargo:rustc-cfg=hwenc");
+        println!("cargo:rustc-cfg=hevcdec");
     }
     let os = match target_os.as_str() {
         "windows" => "win",
@@ -90,7 +116,8 @@ fn main() {
         .file("native/decode.c")
         .file("native/video.c")
         .include(third_party.join("libvpx/source/libvpx"))
-        .include(third_party.join("openh264/src/codec/api"))
+        // x264-src's build script hands over its headers' folder.
+        .include(std::env::var_os("DEP_X264_INCLUDE").expect("x264-src's headers"))
         .include(third_party.join("ffmpeg"))
         .include(third_party.join("dav1d/libdav1d/include"))
         .include(third_party.join("libyuv/include"))

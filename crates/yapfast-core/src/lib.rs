@@ -14,6 +14,7 @@ pub use yapfast_discord;
 pub mod application;
 mod audio_io;
 pub mod backend;
+pub mod blocks;
 #[cfg(feature = "matrix")]
 pub mod calls;
 pub mod camera;
@@ -68,6 +69,8 @@ pub mod ring;
 pub mod runtime;
 #[cfg(feature = "matrix")]
 pub mod session;
+#[cfg(feature = "discord")]
+pub mod soundboard;
 pub mod sounds;
 pub mod spoiler;
 #[cfg(feature = "discord")]

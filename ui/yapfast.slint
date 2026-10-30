@@ -25,14 +25,14 @@ import { Theme, Tip, ReactionHover, Middle, Popup, PopupMotion } from "theme.sli
 import { TitleBar, ResizeEdges } from "title_bar.slint";
 import { GifPicker, GifTile, PickerTab } from "gifs.slint";
 import { ActionButton, IconButton, PingToggle, DeviceToggle, Avatar, TextField, MessagesSkeleton, ContextMenu, MenuItem, MenuRow, DeviceMenu, HeaderToggle, Banner, StatusText } from "controls.slint";
-import { PersonRow, CallLink, CallLinkCard, LinkTouch, SignalIcon, VoiceDock, StreamPip, CallInvite, JoinVoice, ParticipantGrid, CallControls, IncomingCall, SwitchDialog, InputLevel, ShareMenu, ShareScreen, VolumeMenu } from "voice.slint";
+import { PersonRow, CallLink, CallLinkCard, LinkTouch, SignalIcon, VoiceDock, StreamPip, CallInvite, JoinVoice, ParticipantGrid, CallControls, IncomingCall, SwitchDialog, InputLevel, ShareMenu, ShareScreen, VolumeMenu, Soundboard, SoundRow } from "voice.slint";
 import { ServerRow, RoomRow, StatusDot, ServerRail, ServerHeader, RoomList } from "rail.slint";
 import { StagedFile, StagedTile, Composer, MentionRow, MentionList, EmojiSuggestions, RequestBar } from "composer.slint";
 import { EmojiCell, EmojiRow, EmojiSection, MessageRow, ReactionToggle, EmojiButton, EmojiPicker, MessageMenu, MessageGallery, MessageStickers, FileCard, MessageContent, EmbedView, BotTag, NoConversation, ConversationStart, HistoryEdge, UnreadBar, PresentBar, ImageViewer, VideoViewer, VideoPlayer, Polls } from "messages.slint";
-import { SettingsRow, SettingsScreen, AccountSettings, AppearanceSettings, ThemeCard, ThemeColour, VoiceSettings, MessageSettings, NotificationSettings, SoundSettings, AdvancedSettings, DiscordLinkSettings, DiscordSettings, GameActivitySettings, GameExecutable } from "settings.slint";
+import { SettingsRow, SettingsScreen, AccountSettings, AppearanceSettings, ThemeCard, ThemeColour, VoiceSettings, MessageSettings, NotificationSettings, SoundSettings, AdvancedSettings, DiscordLinkSettings, DiscordSettings, BlockedRow, GameActivitySettings, GameExecutable } from "settings.slint";
 import { MemberRow, ProfileData, ProfileServerRow, MemberPanel, ProfileCard, ServerCard, RoleCard } from "people.slint";
 import { RequestRow, FriendRow, FriendsScreen, HeaderTab, RequestsScreen, AddFriendDialog } from "friends.slint";
-import { ContactRow, ForwardRow, ReactionPill, ReactorRow, StatusDialog, NewDmDialog, ForwardDialog, ReactionsDialog, StatusMenu, PersonPrompt, PersonDialog, LeavingDialog, PollAnswerDraft, PollDialog } from "dialogs.slint";
+import { ContactRow, PlaceRow, ReactionPill, ReactorRow, StatusDialog, NewDmDialog, ForwardDialog, QuickSwitcher, ReactionsDialog, StatusMenu, PersonPrompt, PersonDialog, LeavingDialog, PollAnswerDraft, PollDialog } from "dialogs.slint";
 import { InvitePrompt, InviteDialog, JoinPrompt, JoinDialog, ChannelPrompt, ChannelDialog, ProfileEditorPrompt, ProfileEditorDialog } from "server.slint";
 import { SignInScreen, VerifyBanner } from "sign-in.slint";
 import { BoostPicture, BoostPrompt, EngagementPrompt, ServerProfilePrompt, ServerSettingsPrompt, ServerSettingsScreen } from "server_settings.slint";
@@ -55,7 +55,7 @@ export { StagedFile, MentionRow } from "composer.slint";
 export { EmojiCell, EmojiRow, EmojiSection, ReactionChip, ImageCell, FileCell, EmbedField, EmbedFieldRow, EmbedCard, CardButtonStyle, CardButton, TextBlock, CardRowKind, CardRow, ComponentCard, MessageRow, VideoPlayer, PollAction, PollAnswerRow, PollCard, Polls } from "messages.slint";
 export { MemberRow, ProfileRole, ProfileRoleRow, ProfileServerRow, ProfileFriendRow, ProfileData, ActivityRow, ActivityClock } from "people.slint";
 export { RequestRow, FriendRow } from "friends.slint";
-export { ContactRow, ForwardRow, ReactionPill, ReactorRow, PollAnswerDraft } from "dialogs.slint";
+export { ContactRow, PlaceRow, ReactionPill, ReactorRow, PollAnswerDraft } from "dialogs.slint";
 export { FoundRow, PickRow } from "header.slint";
 export { GifTile, GifFavorites } from "gifs.slint";
 
@@ -252,7 +252,8 @@ export component YapfastWindow inherits Window {
     callback close-move-sync;
     in property <bool> leave-open;
     in property <ChannelPrompt> leave-prompt;
-    callback leave-server;
+    callback confirm-leave;
+    callback toggle-silent-leave;
     callback close-leave;
     in property <string> filter-placeholder;
     in property <string> sidebar-empty;
@@ -361,6 +362,10 @@ export component YapfastWindow inherits Window {
     callback remove-game-executable(int);
     in-out property <bool> hide-blocked;
     callback hide-blocked-toggled(bool);
+    /// Those the Discord account blocked, for Settings, and unblocking one
+    /// by user id.
+    in property <[BlockedRow]> blocked-people;
+    callback unblock(string);
     in property <bool> room-selected;
     in property <bool> room-ready;
     in property <bool> room-encrypted;
@@ -622,7 +627,7 @@ export component YapfastWindow inherits Window {
     in property <string> viewer-item;
     in property <int> viewer-index;
     in property <string> forward-preview;
-    in property <[ForwardRow]> forward-targets;
+    in property <[PlaceRow]> forward-targets;
     in-out property <string> forward-query;
     in-out property <string> forward-note;
     in property <int> forward-chosen;
@@ -630,6 +635,15 @@ export component YapfastWindow inherits Window {
     in property <string> forward-empty;
     in property <string> forward-slowmode;
     in property <string> forward-error;
+    /// The quick switcher, open from Ctrl+K until it goes somewhere, and
+    /// where it may go.
+    in property <bool> switcher-open;
+    // However it closes, the composer has the focus again, as in Discord.
+    changed switcher-open => {
+        if !self.switcher-open { root.focus-composer(); }
+    }
+    in property <[PlaceRow]> switcher-places;
+    in-out property <string> switcher-query;
     /// The platform's color emoji font, so reactions do not fall back to outline glyphs.
     in property <string> emoji-font;
     in-out property <string> homeserver: "https://matrix.org";
@@ -668,6 +682,31 @@ export component YapfastWindow inherits Window {
     /// This account's camera is on its way, until its first picture.
     in property <bool> camera-starting;
     in property <bool> call-video;
+    /// The call has Discord's soundboard: its sounds, and why none can be
+    /// played now, when that's so.
+    in property <bool> can-soundboard;
+    in property <[SoundRow]> soundboard-rows;
+    in property <string> soundboard-note;
+    /// The soundboard opened, so its emoji's pictures are wanted.
+    callback soundboard-opened;
+    /// Play the soundboard sound with this id for everyone in the call.
+    callback play-soundboard(string);
+    /// Hear the soundboard sound with this id here only.
+    callback preview-soundboard(string);
+    /// Add the soundboard sound with this id to the favourites, or take it out.
+    callback favorite-soundboard(string, bool);
+    /// The Discord soundboard's volume and entrance sounds, as Voice &
+    /// video in Settings shows them; see VoiceSettings.
+    in-out property <int> soundboard-volume: 100;
+    in property <[string]> entrance-servers;
+    in-out property <int> entrance-server;
+    in property <string> entrance-sound;
+    in property <[SoundRow]> entrance-rows;
+    in property <bool> discord-nitro;
+    callback soundboard-volume-committed(int);
+    callback entrance-sounds-wanted;
+    callback entrance-server-chosen(int);
+    callback choose-entrance-sound(string);
     /// The call's grid of tiles is on screen, in its conversation or over
     /// the whole window.
     out property <bool> grid-shown: root.stage-full || (root.voice-here && (root.voice-panel || root.call-shown));
@@ -695,9 +734,11 @@ export component YapfastWindow inherits Window {
     in property <bool> sharing;
     in property <bool> share-live;
     /// The quality chosen last time: 0 for 720p, 1 for 1080p, 2 for the
-    /// screen's own size, and frames a second.
+    /// screen's own size; frames a second; and whether the encoder works
+    /// harder for a sharper picture.
     in property <int> share-resolution: 1;
     in property <int> share-fps: 30;
+    in property <bool> share-high-quality;
     in property <string> share-status;
     /// The newest preview of what's shared, refreshed by stream-tick while sharing.
     in-out property <image> share-frame;
@@ -982,6 +1023,10 @@ export component YapfastWindow inherits Window {
     in-out property <int> talk-delay: 20;
     in-out property <string> talk-note;
     callback record-talk-key(bool);
+    /// Calls' microphone and speakers volume: see VoiceSettings.
+    in-out property <int> microphone-volume: 100;
+    in-out property <int> speaker-volume: 100;
+    callback call-volumes-changed();
     in-out property <bool> share-typing: true;
     in-out property <bool> notifications: true;
     in-out property <bool> notification-text: true;
@@ -998,6 +1043,8 @@ export component YapfastWindow inherits Window {
     /// applies when Yapfast restarts, which restart does.
     in-out property <bool> gpu-rendering;
     in property <bool> gpu-running;
+    /// Screen sharing encodes on the GPU where it has an encoder.
+    in-out property <bool> gpu-encoding: true;
     /// Closing the window leaves Yapfast in the system tray, when there's one.
     in-out property <bool> close-to-tray: true;
     in property <bool> tray-available;
@@ -1045,14 +1092,14 @@ export component YapfastWindow inherits Window {
     in property <[string]> microphones;
     in property <[string]> speakers;
     in property <[string]> cameras;
-    in property <int> camera-index;
+    in-out property <int> camera-index;
     /// Trying the camera in settings: what it films, refreshed by
     /// stream-tick, or why it can't.
     in-out property <bool> camera-testing;
     in-out property <image> camera-preview;
     in property <string> camera-note;
-    in property <int> microphone-index;
-    in property <int> speaker-index;
+    in-out property <int> microphone-index;
+    in-out property <int> speaker-index;
     /// The microphone level from 0 to 1, refreshed by meter-tick while the input menu is open.
     in-out property <float> input-level;
     /// Why the level can't be shown, if it can't.
@@ -1101,8 +1148,8 @@ export component YapfastWindow inherits Window {
     callback toggle-share;
     /// Share what share-screens, then share-windows, list at this index, or
     /// the screen when they list none, at this resolution, as in
-    /// share-resolution, and frame rate.
-    callback go-live(int, int, int);
+    /// share-resolution, frame rate, and quality, as in share-high-quality.
+    callback go-live(int, int, int, bool);
     /// While sharing, share what share-screens, then share-windows, list at
     /// this index in place of what's shared, or what the system's dialog
     /// picks when they list none.
@@ -1203,6 +1250,9 @@ export component YapfastWindow inherits Window {
     callback forward-send(string);
     callback forward-search;
     callback close-forward;
+    callback switcher-search(string);
+    callback switch-to(string);
+    callback close-switcher;
     callback visit-leaving-link;
     callback close-leaving-link;
     callback confirm-delete-message;
@@ -1458,6 +1508,7 @@ export component YapfastWindow inherits Window {
     property <int> pick-source;
     property <int> pick-resolution;
     property <int> pick-fps;
+    property <bool> pick-high-quality;
     // The menu switches what's shared, as it was when it opened.
     property <bool> pick-switch;
     function open-share-menu(x: length, y: length) {
@@ -1465,6 +1516,7 @@ export component YapfastWindow inherits Window {
         root.pick-source = 0;
         root.pick-resolution = root.share-resolution;
         root.pick-fps = root.share-fps;
+        root.pick-high-quality = root.share-high-quality;
         root.pick-switch = root.sharing;
         // Shown once the list is in, so it opens at its full height. Where
         // the system's dialog picks what to share, a switch goes straight to it.
@@ -1476,6 +1528,24 @@ export component YapfastWindow inherits Window {
             share-menu.show();
         }
     }
+    function open-soundboard(x: length, y: length) {
+        root.menu-x = x; root.menu-y = y;
+        root.soundboard-opened();
+        soundboard-menu.show();
+    }
+    soundboard-menu := PopupWindow {
+        x: max(8px, min(root.width - self.width - 8px, root.menu-x - 6px));
+        y: max(8px, root.menu-y - self.height - 6px);
+        width: board.width; height: board.height;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+        board := Soundboard {
+            rows: root.soundboard-rows; note: root.soundboard-note; emoji-font: root.emoji-font;
+            play(id) => { root.play-soundboard(id); }
+            preview(id) => { root.preview-soundboard(id); }
+            favorite(id, on) => { root.favorite-soundboard(id, on); }
+            close => { soundboard-menu.close(); }
+        }
+    }
     share-menu := PopupWindow {
         x: max(8px, min(root.width - self.width - 8px, root.menu-x - 6px));
         y: max(8px, root.menu-y - self.height - 6px);
@@ -1485,11 +1555,12 @@ export component YapfastWindow inherits Window {
         ShareMenu {
             screens: root.share-screens; windows: root.share-windows; switching: root.pick-switch;
             pick-source <=> root.pick-source; pick-resolution <=> root.pick-resolution; pick-fps <=> root.pick-fps;
-            go-live(source, resolution, fps) => {
+            pick-high-quality <=> root.pick-high-quality;
+            go-live(source, resolution, fps, high-quality) => {
                 if root.pick-switch {
                     root.switch-live(source);
                 } else {
-                    root.go-live(source, resolution, fps);
+                    root.go-live(source, resolution, fps, high-quality);
                 }
                 share-menu.close();
             }
@@ -1956,11 +2027,13 @@ export component YapfastWindow inherits Window {
                     can-share: root.can-share; sharing: root.sharing; share-live: root.share-live; share-status: root.share-status;
                     share-watchers: root.share-viewers.length;
                     can-film: root.can-film; camera-on: root.camera-on; camera-starting: root.camera-starting;
+                    can-soundboard: root.can-soundboard;
                     leave-voice => { root.leave-voice(); }
                     dismiss-voice-error => { root.dismiss-voice-error(); }
                     toggle-camera => { root.toggle-camera(); }
                     toggle-share => { root.toggle-share(); }
                     open-share-menu(x, y) => { root.open-share-menu(x, y); }
+                    open-soundboard(x, y) => { root.open-soundboard(x, y); }
                     open-call-link(x, y, width, height) => { root.open-call-link(x, y, width, height); }
                 }
                 // Account panel.
@@ -2353,11 +2426,13 @@ export component YapfastWindow inherits Window {
                                     muted: root.muted; deafened: root.deafened; voice-ready: root.voice-ready; voice-leaving: root.voice-leaving;
                                     can-share: root.can-share; sharing: root.sharing;
                                     can-film: root.can-film; camera-on: root.camera-on; camera-starting: root.camera-starting;
+                                    can-soundboard: root.can-soundboard;
                                     toggle-camera => { root.toggle-camera(); }
                                     toggle-mute => { root.toggle-mute(); }
                                     toggle-deafen => { root.toggle-deafen(); }
                                     toggle-share => { root.toggle-share(); }
                                     open-share-menu(x, y) => { root.open-share-menu(x, y); }
+                                    open-soundboard(x, y) => { root.open-soundboard(x, y); }
                                     leave-voice => { root.leave-voice(); }
                                 }
                             }
@@ -3192,15 +3267,24 @@ export component YapfastWindow inherits Window {
             delete-theme => { root.delete-theme(); }
         }
         if root.settings-section == 1: VoiceSettings {
-            microphones: root.microphones; microphone-index: root.microphone-index;
-            speakers: root.speakers; speaker-index: root.speaker-index;
-            cameras: root.cameras; camera-index: root.camera-index;
+            microphones: root.microphones; microphone-index <=> root.microphone-index;
+            speakers: root.speakers; speaker-index <=> root.speaker-index;
+            cameras: root.cameras; camera-index <=> root.camera-index;
             camera-testing <=> root.camera-testing; camera-preview: root.camera-preview; camera-note: root.camera-note;
             unmute-on-join <=> root.unmute-on-join; level-voice <=> root.level-voice;
             noise-suppression <=> root.noise-suppression; noise-strength <=> root.noise-strength; dereverb <=> root.dereverb; discord: root.discord-linked;
             sensitivity <=> root.sensitivity; gate-level: root.gate-level; gate-sending: root.gate-sending; gate-meter-note: root.gate-meter-note;
             input-mode <=> root.input-mode; talk-key: root.talk-key; talk-recording <=> root.talk-recording;
             talk-delay <=> root.talk-delay; talk-note: root.talk-note;
+            microphone-volume <=> root.microphone-volume; speaker-volume <=> root.speaker-volume;
+            soundboard-volume <=> root.soundboard-volume; entrance-servers: root.entrance-servers;
+            entrance-server <=> root.entrance-server; entrance-sound: root.entrance-sound;
+            entrance-rows: root.entrance-rows; nitro: root.discord-nitro; emoji-font: root.emoji-font;
+            soundboard-volume-committed(value) => { root.soundboard-volume-committed(value); }
+            entrance-sounds-wanted => { root.entrance-sounds-wanted(); }
+            entrance-server-chosen(index) => { root.entrance-server-chosen(index); }
+            choose-entrance-sound(id) => { root.choose-entrance-sound(id); }
+            call-volumes-changed => { root.call-volumes-changed(); }
             record-talk-key(on) => { root.record-talk-key(on); }
             select-microphone(index) => { root.select-microphone(index); }
             select-speaker(index) => { root.select-speaker(index); }
@@ -3232,6 +3316,7 @@ export component YapfastWindow inherits Window {
         }
         if root.settings-section == 6: AdvancedSettings {
             gpu-rendering <=> root.gpu-rendering; gpu-running: root.gpu-running;
+            gpu-encoding <=> root.gpu-encoding;
             close-to-tray <=> root.close-to-tray; tray-available: root.tray-available;
             multiple-windows <=> root.multiple-windows;
             start-on-sign-in <=> root.start-on-sign-in; autostart-available: root.autostart-available;
@@ -3258,6 +3343,8 @@ export component YapfastWindow inherits Window {
             show-idle-toggled(shown) => { root.show-idle = shown; root.show-idle-toggled(shown); }
             hide-blocked: root.hide-blocked;
             hide-blocked-toggled(hide) => { root.hide-blocked = hide; root.hide-blocked-toggled(hide); }
+            blocked: root.blocked-people;
+            unblock(id) => { root.unblock(id); }
             show-hidden-channels-toggled(shown) => { root.show-hidden-channels = shown; root.show-hidden-channels-toggled(shown); }
             sync-discord-reads-toggled(sync) => { root.sync-discord-reads = sync; root.sync-discord-reads-toggled(sync); }
         }
@@ -3575,7 +3662,8 @@ export component YapfastWindow inherits Window {
     if leave-motion.shown: ChannelDialog {
         motion: leave-motion.amount;
         prompt: root.leave-prompt;
-        save => { root.leave-server(); }
+        save => { root.confirm-leave(); }
+        tick => { root.toggle-silent-leave(); }
         close => { root.close-leave(); }
     }
     // About a DM's other person; see PersonDialog.
@@ -3773,6 +3861,15 @@ export component YapfastWindow inherits Window {
                 }
             }
         }
+    }
+    // Discord's quick switcher; see QuickSwitcher.
+    switcher-motion := PopupMotion { open: root.switcher-open; }
+    if switcher-motion.shown: QuickSwitcher {
+        motion: switcher-motion.amount;
+        switcher-places: root.switcher-places; switcher-query <=> root.switcher-query;
+        switcher-search(query) => { root.switcher-search(query); }
+        switch-to(id) => { root.switch-to(id); }
+        close-switcher => { root.close-switcher(); }
     }
     // Over everything, as the request it confirms may come from anywhere.
     mfa-motion := PopupMotion { open: root.mfa-open; }

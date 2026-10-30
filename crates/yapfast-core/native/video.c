@@ -5,7 +5,8 @@
  * H264 on macOS, whose archive carries FFmpeg's audio decoders and no video
  * ones, where videotoolbox.c decodes it. The
  * caller supplies the file through two functions, so it can arrive while it
- * plays. Only 8-bit 4:2:0 pictures show. */
+ * plays. Pictures show in 4:2:0, 4:2:2 or 4:4:4 at 8 or 10 bits, or in
+ * 4:2:0 at 12, as far as libyuv goes. */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include "dav1d/dav1d.h"
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
+#include "libavutil/pixdesc.h"
 #include "libyuv/convert_argb.h"
 #include "libyuv/scale.h"
 #include "vpx/vp8dx.h"
@@ -31,7 +33,11 @@ enum { DECODER_AVCODEC, DECODER_VPX, DECODER_DAV1D, DECODER_VIDEOTOOLBOX };
 enum { MAX_SIDE = 8192 };
 
 /* What yapfast_video_next returns. */
-enum { END = 0, PICTURE = 1, SOUND = 2, FAILED = -1, UNSUPPORTED = -2 };
+enum { END = 0, PICTURE = 1, SOUND = 2, HELD = 3, FAILED = -1, UNSUPPORTED = -2 };
+
+/* The most pictures' packets, and bytes of them, held back while reading on
+ * to the sound: in a file, sound can trail its pictures by a second or so. */
+enum { HELD_PACKETS = 256, HELD_BYTES = 4 << 20 };
 
 /* Reads up to `size` bytes: how many, 0 at the end of the file, or a
  * negative number to give up. */
@@ -50,10 +56,18 @@ struct yapfast_video_info {
   int channels;
 };
 
-/* A decoded picture as I420 planes, and how to read its colours. */
+/* How far a picture's colour planes are halved: across and down, across
+ * only, or not at all. */
+enum { LAYOUT_420, LAYOUT_422, LAYOUT_444 };
+
+/* A decoded picture as planes of Y, U and V, and how to read its colours.
+ * Deeper than 8 bits, a sample takes two bytes. */
 struct planes {
   int width;
   int height;
+  int depth;
+  /* A LAYOUT_ value, or -1 for one Yapfast doesn't show. */
+  int layout;
   const uint8_t *data[3];
   int stride[3];
   int bt709;
@@ -107,7 +121,14 @@ struct yapfast_video {
   float *samples;
   size_t samples_size;
   int sample_frames;
-  /* The demuxer reached the end and the decoders were told. */
+  /* Pictures' packets read ahead of the sound, oldest at `held_first`. */
+  AVPacket *held[HELD_PACKETS];
+  int held_first;
+  int held_count;
+  size_t held_bytes;
+  /* The demuxer reached the end, and the sound's decoder was told. */
+  int read_all;
+  /* The picture decoder was told too. */
   int sent_all;
   /* Planes scaled to the size asked for. */
   uint8_t *scaled;
@@ -126,8 +147,19 @@ static int64_t seek(void *opaque, int64_t offset, int whence) {
   return video->seek(video->source, offset, whence & ~AVSEEK_FORCE);
 }
 
+/* Lets go of the pictures' packets held back. */
+static void drop_held(struct yapfast_video *video) {
+  for (int index = 0; index < video->held_count; index++) {
+    av_packet_free(&video->held[(video->held_first + index) % HELD_PACKETS]);
+  }
+  video->held_first = 0;
+  video->held_count = 0;
+  video->held_bytes = 0;
+}
+
 void yapfast_video_free(struct yapfast_video *video) {
   if (!video) return;
+  drop_held(video);
   avformat_close_input(&video->format);
   if (video->io) av_freep(&video->io->buffer);
   avio_context_free(&video->io);
@@ -255,8 +287,14 @@ static void open_sound(struct yapfast_video *video) {
   video->channels = context->ch_layout.nb_channels;
 }
 
+/* What yapfast_video_open's `sound` asks for: the video alone, its sound
+ * too, or only the sound of a file that may have no pictures, such as an MP3
+ * or an Ogg file. */
+enum { PICTURES_ONLY = 0, WITH_SOUND = 1, SOUND_ONLY = 2 };
+
 /* Opens the first video in the file `source`, or returns NULL. With
- * `sound`, its sound comes too. What it is goes in `info`. */
+ * `sound`, its sound comes too, or with SOUND_ONLY, only its sound, which
+ * yapfast_video_next gives without pictures. What it is goes in `info`. */
 struct yapfast_video *yapfast_video_open(void *source, yapfast_read read, yapfast_seek seek_to,
                                    unsigned threads, int sound, struct yapfast_video_info *info) {
   /* FFmpeg writes to the standard error; Yapfast reports what fails itself. */
@@ -285,6 +323,29 @@ struct yapfast_video *yapfast_video_open(void *source, yapfast_read read, yapfas
     video->format = NULL;
     yapfast_video_free(video);
     return NULL;
+  }
+  if (sound == SOUND_ONLY) {
+    video->stream = -1;
+    /* An MP3's rate and channels are in its frames, not in a header. */
+    if (avformat_find_stream_info(video->format, NULL) < 0) {
+      yapfast_video_free(video);
+      return NULL;
+    }
+    open_sound(video);
+    if (video->sound_stream < 0) {
+      yapfast_video_free(video);
+      return NULL;
+    }
+    for (unsigned index = 0; index < video->format->nb_streams; index++) {
+      if ((int)index != video->sound_stream) video->format->streams[index]->discard = AVDISCARD_ALL;
+    }
+    video->start = video->format->start_time == AV_NOPTS_VALUE ? 0 : video->format->start_time;
+    info->duration_ms = video->format->duration != AV_NOPTS_VALUE
+                            ? video->format->duration / (AV_TIME_BASE / 1000)
+                            : -1;
+    info->sample_rate = video->sample_rate;
+    info->channels = video->channels;
+    return video;
   }
   video->stream = av_find_best_stream(video->format, AVMEDIA_TYPE_VIDEO, -1, -1, NULL, 0);
   if (video->stream < 0) {
@@ -345,6 +406,21 @@ static int64_t microseconds(const struct yapfast_video *video, int64_t pts) {
   return FFMAX(time - video->start, 0);
 }
 
+/* The layout whose colour planes are halved `x_shift` times across and
+ * `y_shift` times down, or -1. */
+static int layout(unsigned x_shift, unsigned y_shift) {
+  if (x_shift == 0) return y_shift == 0 ? LAYOUT_444 : -1;
+  if (x_shift == 1) return y_shift == 1 ? LAYOUT_420 : y_shift == 0 ? LAYOUT_422 : -1;
+  return -1;
+}
+
+/* Whether libyuv can draw the picture: it has no 12-bit 4:2:2 or 4:4:4. */
+static int drawable(const struct planes *planes) {
+  if (planes->layout < 0) return 0;
+  return planes->depth == 8 || planes->depth == 10 ||
+         (planes->depth == 12 && planes->layout == LAYOUT_420);
+}
+
 /* Takes the picture decoder's next picture: 1 with one, 0 when it wants data. */
 static int receive_picture(struct yapfast_video *video, int64_t *time_ms) {
   struct planes *planes = &video->planes;
@@ -378,18 +454,24 @@ static int receive_picture(struct yapfast_video *video, int64_t *time_ms) {
       int received = avcodec_receive_frame(video->context, frame);
       if (received == AVERROR(EAGAIN) || received == AVERROR_EOF) return 0;
       if (received < 0) return FAILED;
-      if (frame->format != AV_PIX_FMT_YUV420P && frame->format != AV_PIX_FMT_YUVJ420P) {
+      /* Three planes, in this machine's byte order. */
+      const AVPixFmtDescriptor *format = av_pix_fmt_desc_get(frame->format);
+      if (!format || format->nb_components != 3 || !(format->flags & AV_PIX_FMT_FLAG_PLANAR) ||
+          (format->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_BE | AV_PIX_FMT_FLAG_FLOAT))) {
         return UNSUPPORTED;
       }
+      int jpeg = frame->format == AV_PIX_FMT_YUVJ420P || frame->format == AV_PIX_FMT_YUVJ422P ||
+                 frame->format == AV_PIX_FMT_YUVJ444P;
       *planes = (struct planes){
           .width = frame->width,
           .height = frame->height,
+          .depth = format->comp[0].depth,
+          .layout = layout(format->log2_chroma_w, format->log2_chroma_h),
           .bt709 = bt709(frame->colorspace == AVCOL_SPC_UNSPECIFIED
                              ? -1
                              : frame->colorspace == AVCOL_SPC_BT709,
                          frame->height),
-          .full_range =
-              frame->color_range == AVCOL_RANGE_JPEG || frame->format == AV_PIX_FMT_YUVJ420P,
+          .full_range = frame->color_range == AVCOL_RANGE_JPEG || jpeg,
       };
       for (int plane = 0; plane < 3; plane++) {
         planes->data[plane] = frame->data[plane];
@@ -401,10 +483,11 @@ static int receive_picture(struct yapfast_video *video, int64_t *time_ms) {
     case DECODER_VPX: {
       vpx_image_t *image = vpx_codec_get_frame(&video->vpx, &video->vpx_iter);
       if (!image) return 0;
-      if (image->fmt != VPX_IMG_FMT_I420) return UNSUPPORTED;
       *planes = (struct planes){
           .width = (int)image->d_w,
           .height = (int)image->d_h,
+          .depth = image->fmt & VPX_IMG_FMT_HIGHBITDEPTH ? (int)image->bit_depth : 8,
+          .layout = layout(image->x_chroma_shift, image->y_chroma_shift),
           .bt709 = bt709(image->cs == VPX_CS_UNKNOWN ? -1 : image->cs == VPX_CS_BT_709,
                          (int)image->d_h),
           .full_range = image->range == VPX_CR_FULL_RANGE,
@@ -430,13 +513,15 @@ static int receive_picture(struct yapfast_video *video, int64_t *time_ms) {
       if (got == DAV1D_ERR(EAGAIN)) return 0;
       if (got < 0) return FAILED;
       video->dav1d_holds = 1;
-      if (picture->p.layout != DAV1D_PIXEL_LAYOUT_I420 || picture->p.bpc != 8) {
-        return UNSUPPORTED;
-      }
       const Dav1dSequenceHeader *sequence = picture->seq_hdr;
       *planes = (struct planes){
           .width = picture->p.w,
           .height = picture->p.h,
+          .depth = picture->p.bpc,
+          .layout = picture->p.layout == DAV1D_PIXEL_LAYOUT_I420   ? LAYOUT_420
+                    : picture->p.layout == DAV1D_PIXEL_LAYOUT_I422 ? LAYOUT_422
+                    : picture->p.layout == DAV1D_PIXEL_LAYOUT_I444 ? LAYOUT_444
+                                                                   : -1,
           .bt709 = bt709(sequence->mtrx == DAV1D_MC_UNKNOWN ? -1 : sequence->mtrx == DAV1D_MC_BT709,
                          picture->p.h),
           .full_range = sequence->color_range,
@@ -518,17 +603,15 @@ static int receive_sound(struct yapfast_video *video, int64_t *time_ms) {
   return 1;
 }
 
-/* Hands a decoder the file's next packet, or tells them both it ended. */
-static int feed(struct yapfast_video *video) {
-  /* dav1d refused data yet had no picture to give back. */
-  if (video->decoder == DECODER_DAV1D && video->dav1d_pending.sz > 0) return FAILED;
-  AVPacket *packet = video->packet;
+/* Reads the file's next packet into `packet`: 1 with the pictures', 0 after
+ * handing the sound's to its decoder or at the end, or FAILED. */
+static int demux(struct yapfast_video *video, AVPacket *packet) {
   for (;;) {
     int read = av_read_frame(video->format, packet);
     if (read == AVERROR_EXIT) return FAILED;
     /* A damaged file shows what came before the damage. */
     if (read < 0) {
-      video->sent_all = 1;
+      video->read_all = 1;
       if (video->decoder == DECODER_AVCODEC) avcodec_send_packet(video->context, NULL);
 #ifdef __APPLE__
       /* Let go of whatever the decoder held back to put in order. */
@@ -537,7 +620,7 @@ static int feed(struct yapfast_video *video) {
       if (video->sound_context) avcodec_send_packet(video->sound_context, NULL);
       return 0;
     }
-    if (packet->stream_index == video->stream) break;
+    if (packet->stream_index == video->stream) return 1;
     if (packet->stream_index == video->sound_stream) {
       /* Damaged sound is left out. */
 #ifdef __APPLE__
@@ -557,6 +640,29 @@ static int feed(struct yapfast_video *video) {
       return 0;
     }
     av_packet_unref(packet);
+  }
+}
+
+/* Hands the picture decoder its next packet, held back or read from the
+ * file, or tells it the file ended. */
+static int feed(struct yapfast_video *video) {
+  /* dav1d refused data yet had no picture to give back. */
+  if (video->decoder == DECODER_DAV1D && video->dav1d_pending.sz > 0) return FAILED;
+  AVPacket *packet = video->packet;
+  if (video->held_count > 0) {
+    AVPacket **held = &video->held[video->held_first];
+    video->held_bytes -= (size_t)(*held)->size;
+    av_packet_move_ref(packet, *held);
+    av_packet_free(held);
+    video->held_first = (video->held_first + 1) % HELD_PACKETS;
+    video->held_count--;
+  } else if (video->read_all) {
+    video->sent_all = 1;
+    if (video->decoder == DECODER_AVCODEC) avcodec_send_packet(video->context, NULL);
+    return 0;
+  } else {
+    int read = demux(video, packet);
+    if (read <= 0) return read;
   }
   int result = 0;
   switch (video->decoder) {
@@ -599,29 +705,76 @@ static int feed(struct yapfast_video *video) {
   return result;
 }
 
+/* Reads on towards the sound, holding back the pictures' packets: 0 after a
+ * packet, HELD when no more can be held or the sound ended, or FAILED. */
+static int feed_sound(struct yapfast_video *video) {
+  if (!video->sound_context || video->read_all || video->held_count == HELD_PACKETS ||
+      video->held_bytes >= HELD_BYTES) {
+    return HELD;
+  }
+  AVPacket *packet = video->packet;
+  int read = demux(video, packet);
+  if (read <= 0) return read;
+  AVPacket *held = av_packet_alloc();
+  if (!held) {
+    av_packet_unref(packet);
+    return FAILED;
+  }
+  av_packet_move_ref(held, packet);
+  video->held[(video->held_first + video->held_count) % HELD_PACKETS] = held;
+  video->held_count++;
+  video->held_bytes += (size_t)held->size;
+  return 0;
+}
+
 /* Decodes up to the next picture or sound, in the order the file has them,
  * with when it plays in milliseconds from the start, or -1 when the file
  * doesn't say. Returns PICTURE or SOUND, which stay until the next call; END;
- * or a negative number when the video can't play. */
-int yapfast_video_next(struct yapfast_video *video, int64_t *time_ms) {
+ * or a negative number when the video can't play. Without `pictures`, only
+ * sound comes, the pictures' packets held back for later calls, or HELD. */
+int yapfast_video_next(struct yapfast_video *video, int64_t *time_ms, int pictures) {
   for (;;) {
-    int got = receive_picture(video, time_ms);
-    if (got < 0) return got;
-    if (got) {
-      if (video->planes.width <= 0 || video->planes.height <= 0 ||
-          video->planes.width > MAX_SIDE || video->planes.height > MAX_SIDE) {
-        return FAILED;
+    if (pictures) {
+      int got = receive_picture(video, time_ms);
+      if (got < 0) return got;
+      if (got) {
+        if (!drawable(&video->planes)) return UNSUPPORTED;
+        if (video->planes.width <= 0 || video->planes.height <= 0 ||
+            video->planes.width > MAX_SIDE || video->planes.height > MAX_SIDE) {
+          return FAILED;
+        }
+        return PICTURE;
       }
-      return PICTURE;
     }
-    got = receive_sound(video, time_ms);
+    int got = receive_sound(video, time_ms);
     if (got < 0) return got;
     if (got) return SOUND;
+    if (!pictures) {
+      int fed = feed_sound(video);
+      if (fed != 0) return fed;
+      continue;
+    }
     if (video->sent_all) return END;
     int fed = feed(video);
     if (fed < 0) return fed;
   }
 }
+
+typedef int (*scale_8)(const uint8_t *, int, const uint8_t *, int, const uint8_t *, int, int, int,
+                       uint8_t *, int, uint8_t *, int, uint8_t *, int, int, int, enum FilterMode);
+typedef int (*scale_16)(const uint16_t *, int, const uint16_t *, int, const uint16_t *, int, int,
+                        int, uint16_t *, int, uint16_t *, int, uint16_t *, int, int, int,
+                        enum FilterMode);
+typedef int (*to_argb_8)(const uint8_t *, int, const uint8_t *, int, const uint8_t *, int,
+                         uint8_t *, int, const struct YuvConstants *, int, int);
+typedef int (*to_argb_16)(const uint16_t *, int, const uint16_t *, int, const uint16_t *, int,
+                          uint8_t *, int, const struct YuvConstants *, int, int);
+
+/* libyuv's functions for each layout. */
+static const scale_8 SCALE_8[] = {I420Scale, I422Scale, I444Scale};
+static const scale_16 SCALE_16[] = {I420Scale_16, I422Scale_16, I444Scale_16};
+static const to_argb_8 TO_ARGB_8[] = {I420ToARGBMatrix, I422ToARGBMatrix, I444ToARGBMatrix};
+static const to_argb_16 TO_ARGB_10[] = {I010ToARGBMatrix, I210ToARGBMatrix, I410ToARGBMatrix};
 
 /* Writes the picture yapfast_video_next gave last into `rgba`, `width * 4`
  * bytes a row, scaled to `width` by `height`. */
@@ -630,10 +783,14 @@ int yapfast_video_picture(struct yapfast_video *video, unsigned char *rgba, int 
   const uint8_t *y = planes->data[0], *u = planes->data[1], *v = planes->data[2];
   int y_stride = planes->stride[0], u_stride = planes->stride[1], v_stride = planes->stride[2];
   if (!y) return FAILED;
+  int layout = planes->layout;
+  /* A sample's bytes. libyuv counts a deeper picture's strides in samples. */
+  int bytes = planes->depth > 8 ? 2 : 1;
   if (width != planes->width || height != planes->height) {
-    int chroma_width = (width + 1) / 2, chroma_height = (height + 1) / 2;
-    size_t luma = (size_t)width * (size_t)height;
-    size_t chroma = (size_t)chroma_width * (size_t)chroma_height;
+    int chroma_width = layout == LAYOUT_444 ? width : (width + 1) / 2;
+    int chroma_height = layout == LAYOUT_420 ? (height + 1) / 2 : height;
+    size_t luma = (size_t)width * (size_t)height * (size_t)bytes;
+    size_t chroma = (size_t)chroma_width * (size_t)chroma_height * (size_t)bytes;
     if (video->scaled_size < luma + 2 * chroma) {
       uint8_t *grown = realloc(video->scaled, luma + 2 * chroma);
       if (!grown) return FAILED;
@@ -641,20 +798,34 @@ int yapfast_video_picture(struct yapfast_video *video, unsigned char *rgba, int 
       video->scaled_size = luma + 2 * chroma;
     }
     uint8_t *scaled_y = video->scaled, *scaled_u = scaled_y + luma, *scaled_v = scaled_u + chroma;
-    if (I420Scale(y, y_stride, u, u_stride, v, v_stride, planes->width, planes->height, scaled_y,
-                  width, scaled_u, chroma_width, scaled_v, chroma_width, width, height,
-                  kFilterBox)) {
-      return FAILED;
-    }
+    int failed =
+        bytes == 1
+            ? SCALE_8[layout](y, y_stride, u, u_stride, v, v_stride, planes->width, planes->height,
+                              scaled_y, width, scaled_u, chroma_width, scaled_v, chroma_width,
+                              width, height, kFilterBox)
+            : SCALE_16[layout]((const uint16_t *)y, y_stride / 2, (const uint16_t *)u,
+                               u_stride / 2, (const uint16_t *)v, v_stride / 2, planes->width,
+                               planes->height, (uint16_t *)scaled_y, width, (uint16_t *)scaled_u,
+                               chroma_width, (uint16_t *)scaled_v, chroma_width, width, height,
+                               kFilterBox);
+    if (failed) return FAILED;
     y = scaled_y, u = scaled_u, v = scaled_v;
-    y_stride = width, u_stride = chroma_width, v_stride = chroma_width;
+    y_stride = width * bytes, u_stride = chroma_width * bytes, v_stride = chroma_width * bytes;
   }
   const struct YuvConstants *matrix =
       planes->bt709 ? (planes->full_range ? &kYvuF709Constants : &kYvuH709Constants)
                     : (planes->full_range ? &kYvuJPEGConstants : &kYvuI601Constants);
   /* libyuv's ABGR is R, G, B, A in memory: its ARGB with U and V swapped. */
-  return I420ToARGBMatrix(y, y_stride, v, v_stride, u, u_stride, rgba, width * 4, matrix, width,
-                          height)
+  if (bytes == 1) {
+    return TO_ARGB_8[layout](y, y_stride, v, v_stride, u, u_stride, rgba, width * 4, matrix, width,
+                             height)
+               ? FAILED
+               : 0;
+  }
+  /* yapfast_video_next gives 12-bit pictures only in 4:2:0. */
+  to_argb_16 to_argb = planes->depth == 10 ? TO_ARGB_10[layout] : I012ToARGBMatrix;
+  return to_argb((const uint16_t *)y, y_stride / 2, (const uint16_t *)v, v_stride / 2,
+                 (const uint16_t *)u, u_stride / 2, rgba, width * 4, matrix, width, height)
              ? FAILED
              : 0;
 }
@@ -686,6 +857,8 @@ int yapfast_video_seek(struct yapfast_video *video, int64_t time_ms) {
     dav1d_flush(video->dav1d);
   }
   video->planes = (struct planes){0};
+  drop_held(video);
+  video->read_all = 0;
   video->sent_all = 0;
 #ifdef __APPLE__
   /* Both decoders hold work from before the target, and it plays no part in

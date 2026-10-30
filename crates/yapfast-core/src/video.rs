@@ -40,7 +40,7 @@ unsafe extern "C" {
         sound: c_int,
         info: *mut Info,
     ) -> *mut Raw;
-    fn yapfast_video_next(video: *mut Raw, time_ms: *mut i64) -> c_int;
+    fn yapfast_video_next(video: *mut Raw, time_ms: *mut i64, pictures: c_int) -> c_int;
     fn yapfast_video_picture(
         video: *mut Raw,
         rgba: *mut c_uchar,
@@ -59,6 +59,9 @@ unsafe extern "C" {
 
 /// FFmpeg's `AVSEEK_SIZE`: asks for the file's size rather than moving.
 const SEEK_SIZE: c_int = 0x10000;
+
+/// video.c's `SOUND_ONLY`: a file's sound, without pictures.
+const SOUND_ONLY: c_int = 2;
 
 /// How much of a video becomes an animation; the rest is left out.
 const ANIMATION_MS: u64 = 60_000;
@@ -171,8 +174,19 @@ impl<'a> Video<'a> {
         Self::open_with(source, sound, threads)
     }
 
+    /// Opens only the sound of a file, which needn't have pictures, such as
+    /// an MP3 or an Ogg file; [`Self::decode_sound`] decodes it.
+    pub fn open_sound(source: impl Source + 'a) -> Option<Self> {
+        Self::open_as(source, SOUND_ONLY, 1)
+    }
+
     /// As [`Self::open`], decoding on up to `threads` threads.
     fn open_with(source: impl Source + 'a, sound: bool, threads: usize) -> Option<Self> {
+        Self::open_as(source, c_int::from(sound), threads)
+    }
+
+    /// Opens what `sound` asks for, as video.c's `yapfast_video_open` takes it.
+    fn open_as(source: impl Source + 'a, sound: c_int, threads: usize) -> Option<Self> {
         let mut source: Box<Box<dyn Source + 'a>> = Box::new(Box::new(source));
         let mut info = Info::default();
         // SAFETY: the source stays boxed in the video for as long as FFmpeg reads it.
@@ -182,7 +196,7 @@ impl<'a> Video<'a> {
                 read_source,
                 seek_source,
                 threads as c_uint,
-                c_int::from(sound),
+                sound,
                 &mut info,
             )
         };
@@ -202,15 +216,31 @@ impl<'a> Video<'a> {
 
     /// Decodes up to the next picture or sound, in the order the file has them.
     pub fn decode(&mut self) -> Result<Next> {
+        self.next(true).map(|next| next.expect("pictures come"))
+    }
+
+    /// Decodes up to the next sound, reading past pictures and keeping them
+    /// for [`Self::decode`]: in a file, sound can trail the pictures it plays
+    /// with by a second. None at the end of the sound, or when no more
+    /// pictures can be kept.
+    pub fn decode_sound(&mut self) -> Result<Option<Option<u64>>> {
+        Ok(self.next(false)?.map(|next| match next {
+            Next::Sound(time) => time,
+            _ => unreachable!("only sound comes"),
+        }))
+    }
+
+    fn next(&mut self, pictures: bool) -> Result<Option<Next>> {
         let mut time_ms = -1;
         // SAFETY: raw is a live video.
-        let got = unsafe { yapfast_video_next(self.raw, &mut time_ms) };
+        let got = unsafe { yapfast_video_next(self.raw, &mut time_ms, c_int::from(pictures)) };
         let time = u64::try_from(time_ms).ok();
         match got {
-            1 => Ok(Next::Picture(time)),
-            2 => Ok(Next::Sound(time)),
-            0 => Ok(Next::End),
-            -2 => bail!("the video's pictures aren't 8-bit 4:2:0"),
+            1 => Ok(Some(Next::Picture(time))),
+            2 => Ok(Some(Next::Sound(time))),
+            0 => Ok(Some(Next::End)),
+            3 => Ok(None),
+            -2 => bail!("the video's pictures are in a format Yapfast doesn't show"),
             _ => bail!("could not decode the video ({got})"),
         }
     }
@@ -431,6 +461,65 @@ mod tests {
         assert!(decode_animation(b"\0\0\0\x20ftypisom not really", 32, 32).is_none());
     }
 
+    #[test]
+    fn shows_deeper_and_less_subsampled_pictures() {
+        let frames = |name: &str| -> Vec<Vec<u8>> {
+            let data = fixture(name);
+            let picture =
+                crate::chat::decode_picture(&data, 32, 32).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!((picture.width, picture.height), (32, 18), "{name}");
+            picture.frames().collect()
+        };
+        // At its own size, a picture isn't scaled first.
+        let first = |name: &str| -> Vec<u8> {
+            let data = fixture(name);
+            let mut video = Video::open(std::io::Cursor::new(&data[..]), false).unwrap();
+            assert!(
+                matches!(video.decode().unwrap(), Next::Picture(_)),
+                "{name}"
+            );
+            let mut rgba = vec![0; 64 * 36 * 4];
+            video.picture(&mut rgba, 64, 36).unwrap();
+            rgba
+        };
+        let mean_difference = |a: &[u8], b: &[u8]| -> f64 {
+            let sum: u64 = a
+                .iter()
+                .zip(b)
+                .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                .sum();
+            sum as f64 / a.len() as f64
+        };
+        // Each made from gif-h264.mp4, so it should look the same as the
+        // first file named with it, within the difference named. Made 4:2:2
+        // or 4:4:4, its colours spread a little, so it's checked against the
+        // H264 of its layout, which is checked loosely against the original.
+        for (name, like, within) in [
+            ("gif-av1-10bit.mp4", "gif-h264.mp4", 3.0),
+            ("gif-av1-12bit.mp4", "gif-h264.mp4", 3.0),
+            ("gif-vp9-10bit.webm", "gif-h264.mp4", 3.0),
+            ("gif-h264-10bit.mp4", "gif-h264.mp4", 3.0),
+            ("gif-h264-422.mp4", "gif-h264.mp4", 8.0),
+            ("gif-h264-444.mp4", "gif-h264.mp4", 12.0),
+            ("gif-vp9-422.webm", "gif-h264-422.mp4", 3.0),
+            ("gif-av1-422-10bit.mp4", "gif-h264-422.mp4", 3.0),
+            ("gif-vp9-444-10bit.webm", "gif-h264-444.mp4", 3.0),
+            ("gif-av1-444.mp4", "gif-h264-444.mp4", 3.0),
+        ] {
+            let (pictures, expected) = (frames(name), frames(like));
+            assert_eq!(pictures.len(), expected.len(), "{name}");
+            for (picture, expected) in pictures.iter().zip(&expected) {
+                let mean = mean_difference(picture, expected);
+                assert!(mean < within, "{name}: off by {mean} a channel");
+            }
+            let mean = mean_difference(&first(name), &first(like));
+            assert!(
+                mean < within,
+                "{name} at its own size: off by {mean} a channel"
+            );
+        }
+    }
+
     /// Each picture's and sound's time, to the end, and how many samples
     /// of each channel the sound held.
     fn timeline(video: &mut Video) -> (Vec<u64>, Vec<u64>, usize) {
@@ -489,5 +578,37 @@ mod tests {
         let mut silent = Video::open(std::io::Cursor::new(&data[..]), false).unwrap();
         assert_eq!(silent.sound, None);
         assert_eq!(timeline(&mut silent).1, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn reads_on_to_sound_keeping_the_pictures() {
+        // A second of pictures, then the second's sound.
+        let data = fixture("video-fragmented.mp4");
+        let mut video = Video::open(std::io::Cursor::new(&data[..]), true).unwrap();
+        let (mut sounds, mut samples) = (vec![], 0);
+        while let Some(time) = video.decode_sound().unwrap() {
+            sounds.push(time.unwrap());
+            samples += video.sound().samples.len() / 2;
+        }
+        assert!(sounds.windows(2).all(|pair| pair[0] < pair[1]));
+        let seconds = samples as f64 / 44_100.0;
+        assert!((1.9..2.2).contains(&seconds), "{seconds} s of sound");
+        // The pictures kept come after, every one, in order.
+        let (pictures, later, _) = timeline(&mut video);
+        assert_eq!(pictures.len(), 50);
+        assert!(pictures.windows(2).all(|pair| pair[1] - pair[0] == 40));
+        assert_eq!(later, Vec::<u64>::new());
+        // A move lets go of what was kept.
+        video.seek(0).unwrap();
+        for _ in 0..5 {
+            video.decode_sound().unwrap().unwrap();
+        }
+        video.seek(0).unwrap();
+        let (again, _, _) = timeline(&mut video);
+        assert_eq!(again, pictures);
+        // Without sound, there's none to read on to.
+        let mut silent = Video::open(std::io::Cursor::new(&data[..]), false).unwrap();
+        assert_eq!(silent.decode_sound().unwrap(), None);
+        assert_eq!(timeline(&mut silent).0, pictures);
     }
 }

@@ -105,6 +105,10 @@ pub struct StreamQuality {
     pub resolution: Resolution,
     /// Frames a second: 15, 30 or 60.
     pub fps: u32,
+    /// A sharper picture from more of the encoder's work, at about twice
+    /// the CPU.
+    #[serde(default)]
+    pub high_quality: bool,
 }
 
 impl Default for StreamQuality {
@@ -112,6 +116,7 @@ impl Default for StreamQuality {
         Self {
             resolution: Resolution::P1080,
             fps: 30,
+            high_quality: false,
         }
     }
 }
@@ -135,6 +140,26 @@ pub struct LinkStats {
     pub pings: Vec<u16>,
     pub loss: Option<f32>,
     pub privacy_code: Option<String>,
+    /// The screen this account shares, while it's live.
+    pub stream: Option<StreamStats>,
+}
+
+/// How this account's shared screen goes out, as its stream worker reports
+/// it each second: the encoder ("h264_nvenc", "x264"), the codec Discord
+/// chose ("H264"), the size and frame rate sent, the kbit/s aimed for and
+/// sent in the last second, and the keyframes viewers asked for and the
+/// packets resent to them since the stream started.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct StreamStats {
+    pub engine: String,
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub target_kbps: u32,
+    pub sent_kbps: u32,
+    pub keyframe_requests: u64,
+    pub resent: u64,
 }
 
 /// Reads the call's [`LinkStats`], which the call measures all along and
@@ -226,6 +251,43 @@ pub struct State {
     pub link_quality: Quality,
     /// Media leaves end-to-end encrypted.
     pub end_to_end: bool,
+    /// The soundboard's sounds this account may play in the call, in
+    /// groups; none where the call has no soundboard, and empty while they
+    /// load.
+    pub soundboard: Option<Arc<[SoundGroup]>>,
+}
+
+/// A join sound the Discord account's settings give.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JoinSound {
+    /// The server it plays in; none for every server without its own.
+    pub server: Option<String>,
+    pub sound: String,
+    /// The sound's own server; none for Discord's own.
+    pub guild: Option<String>,
+}
+
+/// A group of soundboard sounds: the account's favourites, a server's, or
+/// Discord's own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundGroup {
+    pub name: String,
+    pub sounds: Vec<SoundChoice>,
+}
+
+/// A soundboard sound, as the soundboard offers it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundChoice {
+    pub id: String,
+    pub name: String,
+    /// Its Unicode emoji, or empty.
+    pub emoji: String,
+    /// Its custom emoji's picture.
+    pub picture: Option<String>,
+    /// Among the account's favourites.
+    pub favorite: bool,
+    /// The server it's from; none for Discord's own.
+    pub guild: Option<String>,
 }
 
 impl Default for State {
@@ -253,6 +315,7 @@ impl Default for State {
             link: None,
             link_quality: Quality::Unknown,
             end_to_end: false,
+            soundboard: None,
         }
     }
 }
@@ -275,6 +338,7 @@ impl State {
         self.link = None;
         self.link_quality = Quality::Unknown;
         self.end_to_end = false;
+        self.soundboard = None;
     }
 }
 
@@ -298,6 +362,13 @@ pub enum Command {
     /// keeping the stream; on Linux, what the system's dialog picks.
     SwitchLive,
     StopLive,
+    /// Play the soundboard sound with this id for everyone in the call.
+    Soundboard(String),
+    /// Play the soundboard sound with this id here only, to hear it first.
+    PreviewSound(String),
+    /// Add the soundboard sound with this id to the account's favourites,
+    /// or take it out.
+    FavoriteSound(String, bool),
     /// Watch the participant with this id's stream.
     Watch(String),
     StopWatching,
@@ -637,7 +708,7 @@ pub(crate) fn device_id(guid: &str, name: &str) -> String {
 }
 
 /// Marks a device id made from the device's name.
-pub(crate) const NAMED: &str = "name:";
+pub const NAMED: &str = "name:";
 
 #[cfg(test)]
 mod tests {
@@ -657,6 +728,7 @@ mod tests {
             quality: StreamQuality {
                 resolution: Resolution::Source,
                 fps: 60,
+                high_quality: true,
             },
             ..Default::default()
         };

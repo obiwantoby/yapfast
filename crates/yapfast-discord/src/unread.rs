@@ -11,7 +11,7 @@ use crate::{
     event::Event,
     message::{iso_ms, snowflake_at},
     notifications::{Level, Notifications},
-    ready::{Access, Channel, PRIVATE, Private, Server, Thread},
+    ready::{Access, Channel, PRIVATE, Thread},
 };
 
 #[derive(Clone, Copy, Default)]
@@ -417,21 +417,6 @@ impl Unreads {
         Some(last.to_string())
     }
 
-    /// Sets the unread, mention and muted state of a server's text
-    /// channels and threads.
-    pub fn mark(&self, server: &mut Server) {
-        server.muted = self.server_muted(&server.id);
-        let id = server.id.clone();
-        for channel in server.text_channels.iter_mut().chain(&mut server.threads) {
-            (channel.muted, channel.unread, channel.mentions) =
-                self.channel(&id, channel, channel.access);
-            channel.last_read = self.last_read(&id, &channel.id);
-            if let Some(thread) = channel.thread.as_deref_mut() {
-                thread.opened = self.opened(&channel.id);
-            }
-        }
-    }
-
     /// Whether the notification settings keep @everyone and @here, and role
     /// mentions, from calling on this account in a server.
     pub fn suppressed(&self, guild: &str) -> (bool, bool) {
@@ -447,8 +432,8 @@ impl Unreads {
             .is_some_and(|settings| settings.mute.active(now()))
     }
 
-    /// A server's text channel's muted, unread and mention state, as
-    /// [`Self::mark`] sets it, for an account with `access` to it.
+    /// A server's text channel's muted, unread and mention state, for an
+    /// account with `access` to it, as a snapshot marks it.
     pub fn channel(&self, guild: &str, channel: &Channel, access: Access) -> (bool, bool, u64) {
         let settings = self.settings.get(guild);
         let now = now();
@@ -470,17 +455,20 @@ impl Unreads {
         )
     }
 
-    /// Sets the unread, mention and muted state of a DM. A muted DM shows
-    /// neither, as in Discord.
-    pub fn mark_private(&self, private: &mut Private) {
-        private.muted = self
+    /// Whether a DM is muted and unread, its mentions and the last message
+    /// read. A muted DM shows neither unread nor mentions, as in Discord.
+    pub fn private_marks(&self, id: &str) -> (bool, bool, u64, u64) {
+        let muted = self
             .settings
             .get(PRIVATE)
-            .is_some_and(|settings| settings.channel_muted(&private.id, now()));
-        let (unread, mentions) = self.state(PRIVATE, &private.id);
-        private.unread = unread && !private.muted;
-        private.mentions = if private.muted { 0 } else { mentions };
-        private.last_read = self.last_read(PRIVATE, &private.id);
+            .is_some_and(|settings| settings.channel_muted(id, now()));
+        let (unread, mentions) = self.state(PRIVATE, id);
+        (
+            muted,
+            unread && !muted,
+            if muted { 0 } else { mentions },
+            self.last_read(PRIVATE, id),
+        )
     }
 }
 
@@ -581,12 +569,15 @@ mod tests {
         let mut unreads = Unreads::from_ready(&ready);
         unreads.learn_own_member("10", &json!({"joined_at": "2015-01-01T00:00:00+00:00"}));
         let mut server = ready::servers(&ready).remove(0);
-        let state = |unreads: &Unreads, server: &mut Server| {
-            unreads.mark(server);
+        let state = |unreads: &Unreads, server: &mut ready::Server| {
             server
                 .text_channels
                 .iter()
-                .map(|channel| (channel.unread, channel.mentions))
+                .map(|channel| {
+                    let (_, unread, mentions) =
+                        unreads.channel(&server.id, channel, ready::Access::Join);
+                    (unread, mentions)
+                })
                 .collect::<Vec<_>>()
         };
         // 13 was never read but has messages since joining; 14 is in a muted category.
@@ -646,20 +637,20 @@ mod tests {
 
         // Where each channel was read up to, for the "New" divider: never
         // read counts from joining.
-        let read = |server: &Server| {
+        let read = |unreads: &Unreads, server: &ready::Server| {
             server
                 .text_channels
                 .iter()
-                .map(|channel| channel.last_read)
+                .map(|channel| unreads.last_read(&server.id, &channel.id))
                 .collect::<Vec<_>>()
         };
         let joined = snowflake_at(iso_ms("2015-01-01T00:00:00+00:00").unwrap());
-        assert_eq!(read(&server), [500, 400, joined, joined]);
+        assert_eq!(read(&unreads, &server), [500, 400, joined, joined]);
 
         assert_eq!(unreads.mark_read("10", "11").as_deref(), Some("604"));
         assert_eq!(unreads.mark_read("10", "11"), None);
         assert_eq!(state(&unreads, &mut server)[0], (false, 0));
-        assert_eq!(read(&server)[0], 604);
+        assert_eq!(read(&unreads, &server)[0], 604);
 
         unreads.apply(
             &Event::MessageAck,

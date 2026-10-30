@@ -16,8 +16,8 @@ use yapfast_core::{
     application::{
         Action, AddFriend, AppState, Application, BAN_HISTORY, ChannelAsk, ChannelInput,
         ClearAfter, Compose, DmScreen, Effect, INVITE_AGES, INVITE_USES, ListedCategory,
-        MenuChoice, Navigation, NewDm, PersonAsk, ProfileText, ProfileView, Relation, RoleInput,
-        Search, TIMEOUT_TIMES,
+        MenuChoice, Navigation, NewDm, PersonAsk, Place, ProfileText, ProfileView, Relation,
+        RoleInput, Search, TIMEOUT_TIMES,
     },
     backend::Backend,
     chat::{
@@ -65,7 +65,7 @@ use messages::*;
 pub(crate) use pictures::picture as slint_image;
 use pictures::*;
 use profile::*;
-use refresh::{Reach, SidebarShown};
+use refresh::{Reach, SidebarShown, SwitcherShown};
 use tiles::{Focus, Pip, Stage, Tiles};
 use yapfast_ui::*;
 
@@ -281,15 +281,26 @@ const ZOOM_NOTE: Duration = Duration::from_millis(1200);
 
 /// Follows the native window's focus, for notifications, zooms the window
 /// with Ctrl and +, - and 0 or the scroll wheel, keeping the level in the
-/// layout, and takes files dropped on it.
+/// layout, opens the quick switcher with Ctrl+K, and takes files dropped on
+/// it.
 fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
     use slint::winit_030::{
         EventResult,
         winit::{
-            event::{ElementState, WindowEvent},
-            keyboard::{Key, NamedKey},
+            event::{ElementState, KeyEvent, WindowEvent},
+            keyboard::{Key, KeyCode, NamedKey, PhysicalKey},
         },
     };
+    /// The K key: the letter K in the keyboard's layout, or in a layout
+    /// without Latin letters, the key in its place.
+    fn is_k(key: &KeyEvent) -> bool {
+        match &key.logical_key {
+            Key::Character(text) if text.chars().all(|letter| letter.is_ascii_alphabetic()) => {
+                text.eq_ignore_ascii_case("k")
+            }
+            _ => key.physical_key == PhysicalKey::Code(KeyCode::KeyK),
+        }
+    }
     let saved = zoom::saved(adapter.borrow().layout.zoom);
     let adapter = Rc::downgrade(adapter);
     let (to, weak) = (adapter.clone(), window.as_weak());
@@ -479,6 +490,31 @@ fn watch_window(window: &YapfastWindow, adapter: &Rc<RefCell<Adapter>>) {
                     }
                     return EventResult::PreventDefault;
                 }
+                // Ctrl+K opens the quick switcher, or closes it, wherever the
+                // focus is, as in Discord; not over the settings or a link
+                // that asks before it opens, which the window keeps. Those
+                // the application keeps, it checks itself.
+                if let WindowEvent::KeyboardInput { event: key, .. } = event
+                    && key.state == ElementState::Pressed
+                    && keys.control_only()
+                    && is_k(key)
+                    && let Some(window) = weak.upgrade()
+                    && window.get_workspace()
+                    && !window.get_settings_open()
+                    && window.get_leaving_link().is_empty()
+                {
+                    if !key.repeat {
+                        let (adapter, weak) = (adapter.clone(), weak.clone());
+                        slint::Timer::single_shot(Duration::ZERO, move || {
+                            if let (Some(adapter), Some(window)) =
+                                (adapter.upgrade(), weak.upgrade())
+                            {
+                                adapter.borrow_mut().action(&window, Action::ToggleSwitcher);
+                            }
+                        });
+                    }
+                    return EventResult::PreventDefault;
+                }
                 let step = match keys.event(event) {
                     zoom::Outcome::Pass => return EventResult::Propagate,
                     zoom::Outcome::Taken => return EventResult::PreventDefault,
@@ -617,8 +653,16 @@ fn message_text(row: &MessageRow) -> String {
             plain(&row.time_styled)
         ));
     }
+    // Text in blocks reads as each block's.
+    let text = |styled: &slint::StyledText, blocks: &ModelRc<TextBlock>| {
+        if blocks.row_count() == 0 {
+            return plain(styled);
+        }
+        let blocks: Vec<String> = blocks.iter().map(|block| plain(&block.text)).collect();
+        blocks.join("\n")
+    };
     if !row.body.is_empty() {
-        lines.push(plain(&row.styled));
+        lines.push(text(&row.styled, &row.blocks));
     }
     let pictures = |count: usize| std::iter::repeat_n("[Picture]".to_string(), count);
     lines.extend(pictures(row.images.row_count()));
@@ -628,7 +672,6 @@ fn message_text(row: &MessageRow) -> String {
             (embed.has_provider, &embed.provider),
             (embed.has_author, &embed.author),
             (embed.has_title, &embed.title),
-            (embed.has_description, &embed.description),
         ];
         card.extend(
             texts
@@ -636,11 +679,14 @@ fn message_text(row: &MessageRow) -> String {
                 .filter(|(shown, _)| *shown)
                 .map(|(_, text)| plain(text)),
         );
+        if embed.has_description {
+            card.push(text(&embed.description, &embed.description_blocks));
+        }
         for fields in embed.field_rows.iter() {
             let (names, values): (Vec<_>, Vec<_>) = fields
                 .fields
                 .iter()
-                .map(|field| (plain(&field.name), plain(&field.value)))
+                .map(|field| (plain(&field.name), text(&field.value, &field.value_blocks)))
                 .unzip();
             card.push(names.join(" "));
             card.push(values.join(" "));
@@ -927,6 +973,10 @@ struct Layout {
     input_mode: InputMode,
     push_to_talk_key: Option<crate::push_to_talk::Keybind>,
     push_to_talk_release_delay: Option<u32>,
+    /// How loud every call sends the microphone and plays, as sliders'
+    /// percentages from 0% to 200%; 100% unless changed.
+    microphone_volume: Option<u8>,
+    speaker_volume: Option<u8>,
     /// How loud people sound in calls, and their streams, by Discord or
     /// Matrix user id; see [`yapfast_core::volume`]. Unlisted people are as they
     /// come.
@@ -934,6 +984,9 @@ struct Layout {
     stream_volumes: std::collections::BTreeMap<String, f32>,
     /// Those muted for this account alone, from their menu in a call.
     muted_people: std::collections::BTreeSet<String>,
+    /// Those whose soundboard sounds this account doesn't hear, from the
+    /// same menu.
+    soundboard_muted_people: std::collections::BTreeSet<String>,
     /// Others see when this account is typing; on unless turned off.
     share_typing: Option<bool>,
     /// Desktop notifications, and whether they say what messages say; on unless
@@ -955,6 +1008,9 @@ struct Layout {
     each_sound: std::collections::BTreeMap<Sound, u8>,
     /// Yapfast draws with Skia GPU from its next start; see [`graphics`].
     gpu_rendering: bool,
+    /// Screen sharing encodes on the GPU where it has an encoder; on unless
+    /// turned off.
+    gpu_encoding: Option<bool>,
     /// The theme chosen, by its id; Yap unless chosen.
     theme: Option<String>,
     /// The person's own themes, in the order Appearance shows them.
@@ -1038,6 +1094,13 @@ fn choice<T: PartialEq>(choices: &[T], value: T) -> i32 {
         .iter()
         .position(|choice| *choice == value)
         .unwrap_or(0) as i32
+}
+
+/// Calls send the microphone and play at the volume sliders' values.
+fn play_call_volumes(window: &YapfastWindow) {
+    let gain = |value: i32| yapfast_core::volume::from_slider(value.clamp(0, 200) as f32);
+    yapfast_core::volume::set_microphone(gain(window.get_microphone_volume()));
+    yapfast_core::volume::set_speakers(gain(window.get_speaker_volume()));
 }
 
 /// The choice a setting shows at an index; the first if there's none.
@@ -1158,6 +1221,9 @@ impl Layout {
         );
         window.set_talk_delay(self.release_delay() as i32);
         yapfast_core::push_to_talk::set_release_delay(self.release_delay());
+        window.set_microphone_volume(self.microphone_volume.unwrap_or(100).into());
+        window.set_speaker_volume(self.speaker_volume.unwrap_or(100).into());
+        play_call_volumes(window);
         for (person, volume) in &self.volumes {
             yapfast_core::volume::set(yapfast_core::volume::Kind::Voice, person, *volume);
         }
@@ -1167,6 +1233,9 @@ impl Layout {
         for person in &self.muted_people {
             yapfast_core::volume::mute(person, true);
         }
+        for person in &self.soundboard_muted_people {
+            yapfast_core::volume::mute_soundboard(person, true);
+        }
         window.set_share_typing(self.share_typing.unwrap_or(true));
         window.set_notifications(self.notifications.unwrap_or(true));
         window.set_notification_text(self.notification_text.unwrap_or(true));
@@ -1174,6 +1243,9 @@ impl Layout {
         window.set_sound_volume(self.sound_volume.unwrap_or(DEFAULT_SOUND_VOLUME).into());
         window.set_adjust_each_sound(self.adjust_each_sound);
         window.set_gpu_rendering(self.gpu_rendering);
+        window.set_gpu_encoding(self.gpu_encoding.unwrap_or(true));
+        #[cfg(feature = "discord")]
+        yapfast_core::stream_worker::set_hardware_encoding(self.gpu_encoding.unwrap_or(true));
         window.set_close_to_tray(self.close_to_tray.unwrap_or(true));
         window.set_multiple_windows(self.multiple_windows);
         title_bar::show(window, self.system_title_bar);
@@ -1281,7 +1353,8 @@ struct Models {
     /// The picker's sidebar, built with the grid it jumps through.
     emoji_sections: Rc<VecModel<EmojiSection>>,
     emoji_suggestions: Rc<VecModel<EmojiCell>>,
-    forward_targets: Rc<VecModel<ForwardRow>>,
+    forward_targets: Rc<VecModel<PlaceRow>>,
+    switcher_places: Rc<VecModel<PlaceRow>>,
     participants: Rc<VecModel<PersonRow>>,
     /// The GIF picker's tiles.
     gif_tiles: Rc<VecModel<GifTile>>,
@@ -1295,14 +1368,25 @@ struct Models {
     stream_tiles: Rc<VecModel<i32>>,
     /// Who is in the open DM's call, shown above its messages.
     call_people: Rc<VecModel<PersonRow>>,
+    /// The call's soundboard: headings and rows of sounds.
+    soundboard_rows: Rc<VecModel<SoundRow>>,
+    /// The sounds Settings offers as an entrance sound, likewise, and the
+    /// servers to choose one for.
+    entrance_rows: Rc<VecModel<SoundRow>>,
+    entrance_servers: Rc<VecModel<SharedString>>,
     /// Discord friends: all of them, and those around.
     friends: Rc<VecModel<FriendRow>>,
     friends_online: Rc<VecModel<FriendRow>>,
+    /// Those the Discord account blocked, for Settings.
+    blocked: Rc<VecModel<BlockedRow>>,
     /// Browse Channels' rows, after its search.
     browse_rows: Rc<VecModel<BrowseRow>>,
     microphones: Rc<VecModel<SharedString>>,
     speakers: Rc<VecModel<SharedString>>,
     cameras: Rc<VecModel<SharedString>>,
+    /// Each device's name as last listed, by id, for a chosen device that
+    /// isn't connected; see [`device_rows`].
+    device_names: HashMap<String, SharedString>,
     staged: Rc<VecModel<StagedFile>>,
     aside_staged: Rc<VecModel<StagedFile>>,
 }
@@ -1336,6 +1420,7 @@ impl Models {
         window.set_emoji_sections(ModelRc::from(self.emoji_sections.clone()));
         window.set_emoji_suggestions(ModelRc::from(self.emoji_suggestions.clone()));
         window.set_forward_targets(ModelRc::from(self.forward_targets.clone()));
+        window.set_switcher_places(ModelRc::from(self.switcher_places.clone()));
         window.set_participants(ModelRc::from(self.participants.clone()));
         window.set_gif_tiles(ModelRc::from(self.gif_tiles.clone()));
         window.set_share_viewers(ModelRc::from(self.share_viewers.clone()));
@@ -1343,8 +1428,12 @@ impl Models {
         window.set_participant_frames(ModelRc::from(self.participant_frames.clone()));
         window.set_stream_tiles(ModelRc::from(self.stream_tiles.clone()));
         window.set_call_people(ModelRc::from(self.call_people.clone()));
+        window.set_soundboard_rows(ModelRc::from(self.soundboard_rows.clone()));
+        window.set_entrance_rows(ModelRc::from(self.entrance_rows.clone()));
+        window.set_entrance_servers(ModelRc::from(self.entrance_servers.clone()));
         window.set_friends(ModelRc::from(self.friends.clone()));
         window.set_friends_online(ModelRc::from(self.friends_online.clone()));
+        window.set_blocked_people(ModelRc::from(self.blocked.clone()));
         window.set_browse_rows(ModelRc::from(self.browse_rows.clone()));
         window.set_microphones(ModelRc::from(self.microphones.clone()));
         window.set_speakers(ModelRc::from(self.speakers.clone()));
@@ -1403,6 +1492,7 @@ struct Icons {
     leave: slint::Image,
     // Someone's menu in a voice channel.
     mic_off: slint::Image,
+    soundboard: slint::Image,
     deafen: slint::Image,
     move_to: slint::Image,
     disconnect: slint::Image,
@@ -1444,6 +1534,8 @@ struct Adapter {
     aside_restyle: bool,
     /// What the sidebar showed last, so it's built again only once that changes.
     sidebar: Option<SidebarShown>,
+    /// What the quick switcher listed last, while it's open.
+    switcher: Option<SwitcherShown>,
     /// The room ids of the rows a Discord server's channel list drags and
     /// drops, by their places; see RoomRow.
     places: Vec<String>,
@@ -1529,6 +1621,15 @@ struct Adapter {
     preview_camera: Option<yapfast_core::camera::Camera>,
     /// Whose camera picture each place in the call's grid holds.
     frame_ids: Vec<String>,
+    /// The soundboard's sounds as its rows show them, and the pictures'
+    /// revision then, so the rows are made again only when either changes.
+    soundboard_shown: Option<(Arc<[voice::SoundGroup]>, u64)>,
+    /// The same for the entrance sounds Settings offers; the servers it
+    /// offers them for, "All servers" first as none; and the soundboard
+    /// volume shown, so the slider moves only when Discord's does.
+    entrance_shown: Option<(Arc<[voice::SoundGroup]>, u64)>,
+    entrance_servers: Vec<Option<String>>,
+    soundboard_volume_shown: Option<f32>,
     /// Where the call's tiles are, as the grid last said.
     tiles: Option<Tiles>,
     /// The call's tile shown large, and whose stream was watched when the
@@ -1630,6 +1731,9 @@ impl Adapter {
             delete: slint::Image::load_from_svg_data(include_bytes!("../ui/icons/trash-2.svg"))?,
             leave: slint::Image::load_from_svg_data(include_bytes!("../ui/icons/log-out.svg"))?,
             mic_off: slint::Image::load_from_svg_data(include_bytes!("../ui/icons/mic-off.svg"))?,
+            soundboard: slint::Image::load_from_svg_data(include_bytes!(
+                "../ui/icons/soundboard.svg"
+            ))?,
             deafen: slint::Image::load_from_svg_data(include_bytes!(
                 "../ui/icons/headphone-off.svg"
             ))?,
@@ -1676,6 +1780,7 @@ impl Adapter {
                 messages: Arc::new(Vec::new()),
                 rows: Vec::new(),
                 sidebar: None,
+                switcher: None,
                 places: Vec::new(),
                 arranging: None,
                 rail_call: None,
@@ -1715,6 +1820,10 @@ impl Adapter {
                 camera_test: None,
                 preview_camera: None,
                 frame_ids: vec![],
+                soundboard_shown: None,
+                entrance_shown: None,
+                entrance_servers: vec![],
+                soundboard_volume_shown: None,
                 tiles: None,
                 call_focus: None,
                 watched: None,
@@ -2253,6 +2362,7 @@ fn ringing(
     state
         .rooms
         .iter()
+        .map(std::sync::Arc::as_ref)
         .filter(|room| room.incoming && !(voice.active() && voice.room.as_ref() == Some(&room.id)))
 }
 
@@ -2425,6 +2535,10 @@ fn initial(text: &str) -> SharedString {
 }
 
 /// WebRTC names its default entry "default: Device"; show it as "Default (Device)".
+/// How a PulseAudio device list's default entry's id starts: the default
+/// device's name, as WebRTC lists it, after `default: `.
+const DEFAULT_DEVICE: &str = "name:default: ";
+
 fn device_label(name: &str) -> SharedString {
     match name.strip_prefix("default: ") {
         Some(device) => format!("Default ({device})").into(),
@@ -2432,15 +2546,54 @@ fn device_label(name: &str) -> SharedString {
     }
 }
 
-/// Without a choice, voice uses WebRTC's default device, which it lists first.
-fn device_index(devices: &[voice::Device], selected: Option<&str>) -> i32 {
-    let index = match selected {
-        Some(selected) => devices.iter().position(|device| device.id == selected),
+/// A device picker's rows, and the chosen one's index. Without a choice,
+/// voice uses WebRTC's default device, which it lists first. A chosen device
+/// that isn't connected, such as Bluetooth headphones that went away, shows
+/// last as not connected, by the name it was last listed with, rather than
+/// as no device or as another one. `names` keeps those names. The default
+/// entry's id names the device that was the default, and the default it
+/// plays on may have changed since, so it stays the default entry.
+fn device_rows(
+    devices: &[voice::Device],
+    chosen: Option<&str>,
+    names: &mut HashMap<String, SharedString>,
+) -> (Vec<SharedString>, i32) {
+    let mut rows: Vec<SharedString> = devices
+        .iter()
+        .map(|device| device_label(&device.name))
+        .collect();
+    for (device, row) in devices.iter().zip(&rows) {
+        if names.get(&device.id) != Some(row) {
+            names.insert(device.id.clone(), row.clone());
+        }
+    }
+    let index = match chosen {
         None => (!devices.is_empty()).then_some(0),
+        Some(chosen) => Some(
+            devices
+                .iter()
+                .position(|device| device.id == chosen)
+                .or_else(|| {
+                    let default = |id: &str| id.starts_with(DEFAULT_DEVICE);
+                    default(chosen)
+                        .then(|| devices.iter().position(|device| default(&device.id)))
+                        .flatten()
+                })
+                .unwrap_or_else(|| {
+                    let name = names
+                        .get(chosen)
+                        .cloned()
+                        .or_else(|| chosen.strip_prefix(voice::NAMED).map(device_label))
+                        .unwrap_or_else(|| "Chosen device".into());
+                    rows.push(format!("{name} (not connected)").into());
+                    rows.len() - 1
+                }),
+        ),
     };
-    index
+    let index = index
         .and_then(|index| i32::try_from(index).ok())
-        .unwrap_or(-1)
+        .unwrap_or(-1);
+    (rows, index)
 }
 
 fn update_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
