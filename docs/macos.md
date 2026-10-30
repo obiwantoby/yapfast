@@ -74,6 +74,53 @@ when you join a call. Camera access is asked for when you turn a camera on.
   stereo rings the rest of Yapfast uses. WebRTC still mixes, echo-cancels and
   encodes; this only moves samples.
 
+## How the macOS code is shaped
+
+The rule for every file here: **macOS code is additive and scoped, so nothing
+Linux or Windows runs changes behaviour.** Where upstream has a per-platform
+shape, macOS joins it rather than inventing one. The minimum needed, in their
+syntax.
+
+**Per-platform modules.** `crates/yapfast-core/src/audio_io.rs` names each
+backend and aliases it to `platform`:
+
+```rust
+#[cfg(target_os = "linux")]   mod pulse;     #[cfg(target_os = "linux")]   use pulse as platform;
+#[cfg(target_os = "windows")] mod wasapi;    #[cfg(target_os = "windows")] use wasapi as platform;
+#[cfg(target_os = "macos")]   mod coreaudio; #[cfg(target_os = "macos")]   use coreaudio as platform;
+#[cfg(not(any(...)))]          mod unsupported;
+```
+
+`src/autostart.rs` and `src/tray.rs` use the same shape (`linux`, `windows`,
+`macos`, `none`). `src/notify.rs` and `src/paste.rs` are thin enough to use
+inline `#[cfg(target_os = …)]` blocks instead, which is what they did before
+macOS existed.
+
+**The `platform` contract.** A backend is `Output` and `Input` with
+`open`/`write`/`drain`/`flush`/`latency` and `open`/`read`, and — since
+`audio_io/lasting.rs` landed upstream — `pub fn endpoint(id: Option<&str>,
+output: bool) -> String`, the device a stream for that id would open now.
+CoreAudio's answer is the id itself, since its names don't change when a device
+comes back, and empty for the default. New backends have to answer it too.
+
+**Device ids.** `voice::NAMED` (`"name:"`) prefixes a name where a platform has
+no real id. CoreAudio accepts a bare id, `name:` + a name, or a plain name.
+
+**Build scripts.** The root `build.rs` is one `match` on the target OS
+dispatching to `windows_icon()`, `linux_skia()` and `macos()`; the AppKit
+compile and the `-ObjC` link argument live in `macos()`.
+`crates/yapfast-core/build.rs` lists every native source in one
+`for file in […]` for `rerun-if-changed`, then compiles per OS with
+`cc::Build` blocks gated on `target_os`. A new `.c` goes in the list, and in
+the block that owns it.
+
+**Where files go.** The app's own Objective-C is `native/appkit.m` at the root,
+because the root `build.rs` compiles it; core shims live in
+`crates/yapfast-core/native/`. `packaging/macos/` sits beside `linux/`,
+`windows/` and `arch/`. `scripts/build-macos` mirrors `scripts/build-windows`;
+it packs the bundle itself rather than having a separate `package-macos.py`,
+which is the one place the three platforms aren't symmetrical.
+
 ## Known gaps
 
 - **AAC and H264 come from the system, not the archive.** The archive's FFmpeg
