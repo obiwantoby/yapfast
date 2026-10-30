@@ -133,8 +133,8 @@ int yapfast_aac_next(struct yapfast_aac *aac, float *samples, int capacity) {
   OSStatus status = AudioConverterFillComplexBuffer(aac->converter, give_packets, aac, &frames,
                                                    &aac->list, NULL);
   /* The converter took what it was offered, so none of it is waiting any more.
-   * What it couldn't turn into samples yet it keeps, and they come out with the
-   * packets after them. */
+   * An error says nothing about how far it got, so the run goes rather than
+   * risk turning part of it into samples twice; the next packets start clean. */
   aac->size = 0;
   aac->count = 0;
   if (status != noErr) return -1;
