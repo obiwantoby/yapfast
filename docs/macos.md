@@ -7,7 +7,19 @@ Linux and Windows, in a Mac window with a Mac icon.
 
 A release build on one M3, idle on the linking screen, was reported at 77 MB
 of physical footprint, and 87 MB on a second run (`footprint -p`). The README's
-40 MB is the Linux claim for doing nothing. The published Discord-only
+40 MB is the Linux claim for doing nothing.
+
+Measured on the current head, same binary, same machine, differing only by
+`--renderer`: `skia-software` sits at **137 MB** and `skia-opengl` at **211 MB**,
+both at 0.0% CPU once started. That is the `src/graphics.rs` claim reproduced on
+the Mac — software costs about two thirds of what GPU does — and it is why the
+default stays software. `--renderer gpu` on macOS means Skia's OpenGL path, not
+Metal: `src/ui.rs` names `skia-opengl` outright, and Slint 1.18.1 offers Skia
+through OpenGL or Vulkan only, with no wgpu renderer to name. The
+`i-slint-renderer-skia` `wgpu-30` dependency compiles `SkiaRenderer::default_metal`
+but nothing selects it. `lto = "thin"` was tried and made the binary 12.6%
+larger (115.7 MB to 130.3 MB) for no measurable change in an app that idles at
+0.0% CPU, so `lto = "off"` stands. The published Discord-only
 Linux sample, software renderer, channel open, is about 66 MiB PSS and 91 MiB
 RSS at 1120×760. Physical
 footprint is a different measure. The window prefers 1120×760. At 2× its
