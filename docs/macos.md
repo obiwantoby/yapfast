@@ -9,13 +9,13 @@ A release build on one M3, idle on the linking screen, was reported at 77 MB
 of physical footprint, and 87 MB on a second run (`footprint -p`). The README's
 40 MB is the Linux claim for doing nothing.
 
-Measured on the current head, same binary, same machine, differing only by
-`--renderer`: `skia-software` settles at **100 MB** and `skia-opengl` read
-**211 MB**, both at 0.0% CPU once started. The software figure was taken after
-the process had settled; reading it 30 seconds after launch gives 137 MB, so
-early readings overstate it and the settled number is the one to quote. That
-reproduces the `src/graphics.rs` claim on the Mac — software costs well under
-what GPU does — and it is why the default stays software. `--renderer gpu` on
+Measured on the current head, same binary, same machine, both read after ten
+minutes running and differing only by `--renderer`: `skia-software` **100 MB**,
+`skia-opengl` **260 MB**, both at 0.0% CPU. Reading either one early is wrong in
+both directions — software read 137 MB at 30 seconds and opengl read 211 MB — so
+these are settled figures. Software costs 38% of what GPU does, which is further
+than the `src/graphics.rs` claim of about half, and it is why the default stays
+software. `--renderer gpu` on
 macOS means Skia's OpenGL path, not Metal: `src/ui.rs` names `skia-opengl`
 outright, and Slint 1.18.1 offers Skia through OpenGL or Vulkan only, with no
 wgpu renderer to name. The `i-slint-renderer-skia` `wgpu-30` dependency compiles
