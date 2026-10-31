@@ -26,7 +26,11 @@
 #include "audio_aac.h"
 #endif
 
-enum { DECODER_AVCODEC, DECODER_VPX, DECODER_DAV1D, DECODER_VIDEOTOOLBOX };
+/* DECODER_NONE says there are no pictures to decode at all. It has to exist
+ * because the enum's first name is 0, which is what a zeroed struct reads as,
+ * so without it a file with no video looks like it has an FFmpeg video
+ * decoder and a null one. */
+enum { DECODER_NONE = -1, DECODER_AVCODEC, DECODER_VPX, DECODER_DAV1D, DECODER_VIDEOTOOLBOX };
 
 /* The widest or tallest picture Yapfast decodes. A file can claim any size,
  * and each picture would take that much memory. */
@@ -305,6 +309,11 @@ struct yapfast_video *yapfast_video_open(void *source, yapfast_read read, yapfas
   video->read = read;
   video->seek = seek_to;
   video->sound_stream = -1;
+  /* Until open_video says which picture decoder there is, there is none. A
+   * sound-only file never calls it, and the zeroed struct would otherwise read
+   * as DECODER_AVCODEC with a null context: the soundboard played a sound,
+   * reached the end of it, and flushed a null AVCodecContext. */
+  video->decoder = DECODER_NONE;
   const int buffer_size = 1 << 16;
   unsigned char *buffer = av_malloc(buffer_size);
   video->io =
@@ -630,11 +639,14 @@ static int demux(struct yapfast_video *video, AVPacket *packet) {
         if (!video->aac_queued) video->aac_pts = packet->pts;
         if (!yapfast_aac_push(video->aac, packet->data, (size_t)packet->size))
           video->aac_queued++;
-      } else {
+      } else if (video->sound_context) {
+        /* Only when there is one. A sound neither the archive nor the system can
+         * decode gets here with neither, and avcodec_send_packet reads a null
+         * context as the pointer it is. */
         avcodec_send_packet(video->sound_context, packet);
       }
 #else
-      avcodec_send_packet(video->sound_context, packet);
+      if (video->sound_context) avcodec_send_packet(video->sound_context, packet);
 #endif
       av_packet_unref(packet);
       return 0;
